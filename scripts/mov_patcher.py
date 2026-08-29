@@ -153,11 +153,12 @@ def build_sgpd_tsas() -> bytes:
 
 
 def build_csgm(gtype: bytes, payload: bytes, sample_count: int, layers: int) -> bytes:
-    """layers = 时间分层数;Apple 原厂 csgm 第 3 字段即分层数(4207734D 为 3)。"""
+    """layers = 时间分层数;Apple 原厂 csgm 第 3 字段即分层数(4207734D 为 3)。
+    Apple 原厂在 (sample_count-1) 后还有 2 个 u32(0x0f,0x0f) 头,AVFoundation 解析必需。"""
     body = struct.pack(">I4s", 0, gtype)
     for v in (0, 4, layers, 1, 1, 16):
         body += struct.pack(">I", v)
-    body += struct.pack(">I", max(0, sample_count - 1)) + payload
+    body += struct.pack(">III", max(0, sample_count - 1), 15, 15) + payload
     return struct.pack(">I4s", 8 + len(body), b"csgm") + body
 
 
@@ -282,15 +283,12 @@ def patch(input_path: Path, output_path: Path) -> None:
 
     stbl_children = {a.type: atom_bytes(a) for a in stbl.children}
     new_stbl = b""
-    for t in STBL_ORDER:
-        if t == b"sgpd":
-            new_stbl += sgpd_tscl + sgpd_tsas
-        elif t == b"csgm":
-            new_stbl += csgm_tscl + csgm_tsas
-        elif t == b"cslg":
-            if cslg:
-                new_stbl += cslg
-        elif t in stbl_children:
+    for t in [a.type for a in stbl.children]:
+        if t == b"stsd":
+            new_stbl += stbl_children[t] + sgpd_tscl + sgpd_tsas + csgm_tscl + csgm_tsas
+        elif t == b"stco" and cslg:
+            new_stbl += cslg + stbl_children[t]
+        else:
             new_stbl += stbl_children[t]
 
     # ---- 重组输出 ftyp|wide|mdat|moov ----
