@@ -105,7 +105,24 @@ def cmd_prepare(args) -> None:
     name = args.name or video.stem
     asset_id = args.id or str(uuid.uuid4()).upper()
     port = args.port
-    cat = args.category or "A33A55D9-EDEA-4596-A850-6C10B54FBBB5"  # Landscape
+    new_cat_id = None
+    if args.new_category:
+        fb = load_json(FALLBACK)
+        landscape = next(c for c in fb["categories"] if c["id"] == "A33A55D9-EDEA-4596-A850-6C10B54FBBB5")
+        new_cat = dict(landscape)
+        new_cat["id"] = str(uuid.uuid4()).upper()
+        new_cat["localizedNameKey"] = args.new_category
+        # 全新子分类(克隆 Golden Gate 结构)→ 分类完全独立,资产只归本分类
+        sg = next(s for s in landscape["subcategories"] if s["id"] == "67512508-D33E-4CBC-8A9E-BE55CEE35C4C")
+        new_sg = dict(sg)
+        new_sg["id"] = str(uuid.uuid4()).upper()
+        new_sg["localizedNameKey"] = f"{args.new_category} 子分类"
+        new_sg["preferredOrder"] = 99
+        new_cat["subcategories"] = [new_sg]
+        new_cat_id = new_cat["id"]
+        new_sg_id = new_sg["id"]
+        log(f"new category: {args.new_category} = {new_cat_id}(独立,全新子分类 {new_sg_id})")
+        cat = new_cat_id
 
     # 1. 可选转码(合规 HEVC 10bit/240000/temporal-layers=3)
     if args.transcode:
@@ -150,8 +167,11 @@ def cmd_prepare(args) -> None:
     asset["localizedNameKey"] = name
     asset["accessibilityLabel"] = name
     asset["previewImage"] = f"http://127.0.0.1:{port}/{thumb_name}"
-    asset["url-4K-SDR-240FPS"] = f"http://127.0.0.1:{port}/{video_name}"
     asset["categories"] = [cat]
+    if new_cat_id:
+        asset["subcategories"] = [new_sg_id]  # 全新子分类 → 资产只在新分类
+    asset["url"] = f"http://127.0.0.1:{port}/{video_name}"  # 覆盖模板 sylvan URL → 下载本地视频
+    asset["url-4K-SDR-240FPS"] = f"http://127.0.0.1:{port}/{video_name}"  # 扩展实际下载源(优先 url-4K,008 验证)
 
     # 6a. 备份原 entries.json(prepare 时)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -163,6 +183,10 @@ def cmd_prepare(args) -> None:
     d = load_json(FALLBACK)
     d["assets"] = [a for a in d["assets"] if a["id"] != asset_id]
     d["assets"].append(asset)
+    if new_cat_id:
+        # 新分类条目(克隆 Landscape,7 字段必需)
+        d["categories"] = [c for c in d["categories"] if c["id"] != new_cat_id]
+        d["categories"].append(new_cat)
     save_json(ENTRIES, d)
     log(f"entries.json: {len(d['assets'])} assets (injected {name} = {asset_id})")
 
@@ -292,7 +316,8 @@ def main() -> None:
     p.add_argument("video")
     p.add_argument("--name")
     p.add_argument("--thumbnail")
-    p.add_argument("--category")
+    p.add_argument("--category", help="归入现有分类 UUID(默认 Landscape)")
+    p.add_argument("--new-category", help="新建独立分类(克隆 Landscape 模板,资产归入)")
     p.add_argument("--id")
     p.add_argument("--transcode", action="store_true", help="ffmpeg to compliant HEVC 10bit")
     p.add_argument("--port", type=int, default=8181)
