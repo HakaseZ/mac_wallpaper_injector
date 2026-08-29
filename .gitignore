@@ -4,3 +4,4 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 test_videos/
+backup/inject/
