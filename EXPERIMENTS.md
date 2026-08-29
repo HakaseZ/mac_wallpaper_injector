@@ -2,46 +2,58 @@
 
 > 追踪注入测试实验。原则见 agent.md「实验原则」。
 > 每次实验:记录基线 → 执行 → 验证 → **恢复至基线** → commit 本文档。
-> 只保留当前实验内容;历史由 git commit 追踪。
+> 只保留当前实验内容;历史由 git commit 追踪。结论累积见 `EXPERIMENT_CONCLUSIONS.md`。
 
 ---
 
-## 实验 001:无补丁 MOV 注入(阶段 1)
+## 实验 008:攻破 aerials 白名单防火墙(设计)
 
-### 目的
+### 背景
 
-验证"转码规格全达标但**未经 atom patcher 处理**"(无 tapt/sgpd/csgm/cslg)的 MOV 是否被系统壁纸引擎接受并播放。结果决定下一步:写 MOV patcher(阶段 2)或可直接注入。
+007 已验证完整注入闭环(顶替 fallback 资产 + 破宿主缓存 + 面板点击 → 前台下载 → aerials 原生播放)。但注入受**白名单防火墙**限制:面板模型只认 fallback 的 164 个资产 id,新增资产/分类被过滤。用户决策:**保持注入方案,攻破白名单防火墙**。
 
-### 实验开始前的基线(即上一次实验恢复后的状态,首次实验 = 系统初始状态)
+### 防火墙机制(已实证)
+
+```
+SettingsProvider 遍历 fallback 164 资产 id(白名单)
+  → 从 override 查每个 id 的覆盖属性(名字/URL/缩略图)
+  → 按 fallback 分类分组 → 模型
+新增 id 资产 / 新增分类条目 / 修改资产分类 → 全部被忽略或破坏覆盖
+```
+
+- 结构(分类/组)= override 控制(纯注入测试:7 组 → 1 组)
+- 资产 id = fallback 白名单(新增 d4fc948a/E0685AC0 不显示,顶替显示)
+- 宿主缓存跨重启持久(删缓存 + 重启 agent 强制重查)
+
+### 攻破方向(候选,按优先级)
+
+**A. 定位白名单数据源(最优先)**
+- SettingsProvider 构建模型时读什么?fallback 是扩展 bundle 的 entries.json(SIP 保护),但**运行时加载路径**可能可被影响(环境变量/默认值/override 扩展字段?)
+- 方法:fs_usage 或 dtruss 观察扩展构建模型时打开的文件;检查二进制中 fallbackAssetsURL 的构造
+
+**B. 检查 override 的 fallback 加载影响**
+- AerialManifestLocalPathOverride 已确认影响 asset loader;是否也影响 SettingsProvider 的"白名单来源"?纯注入测试显示结构变化(override 分类生效),说明 SettingsProvider 读 override —— 那白名单从哪来?是 fallback 还是 override 与 fallback 的交集?
+- 决定性测试:override = fallback 复制 + 删除几个资产 + 新增几个 → 模型 = 删除的消失 + 新增的过滤?(验证"override 结构 + fallback id 白名单")
+
+**C. 用户 entries.json 角色(排除确认)**
+- ~/Library/.../manifest/entries.json 已验证不进面板模型;但扩展日志有 "Loading downloaded manifest" —— 确认它是否参与 SettingsProvider
+
+**D. id 匹配细节**
+- 大小写/格式变体(fallback 用大写 UUID,注入用大写;试小写/其他格式是否绕过精确匹配)
+
+**E. 动态分析**
+- 若 A 无果:dtruss 断点 SettingsProvider 构建函数,看白名单集合来源
+
+### 成功标准
+
+注入**全新 id 资产**(非顶替)出现在面板模型 = 白名单攻破;或确认防火墙不可破(记录硬边界)。
+
+### 基线
 
 | 项 | 状态 |
 |---|---|
-| 日期 | 2026-08-30 |
-| 系统 | macOS 27.0 (26A5421a),git dev @ f8df7ad |
-| 壁纸 | 静态 image choice(Index.plist `AllSpacesAndDisplays` + `SystemDefault`,Provider=`com.apple.wallpaper.choice.image`) |
-| entries.json | 含自定义 asset `E0685AC0-67EB-449F-935D-2C9B95149026`("MWI Test4",`url-4K-SDR-240FPS` → `http://127.0.0.1:8181/mwi_test4.mov`,category `dynamic-aerials`) |
-| 8181 服务 | `python3 -m http.server 8181 --directory test_videos/`(PID 13590),mov/png 端点 200 |
-| aerials/videos/ | 8 个系统自带 mov(未改动) |
-| 注入物 | `mwi_test4.mov`(4K/30s,规格全达标 ✅,未打补丁)、`mwi_test4.png`(640×360) |
-| 测试文件状态 | 见 `test_videos/TEST_FILES.md` |
-
-### 实验步骤
-
-1. 备份 `Index.plist`、`entries.json`(带时间戳副本,记录路径)
-2. 注入:复刻 livid `setWallpaper` — `AllSpacesAndDisplays` + `SystemDefault` 的 Desktop/Idle 容器:
-   - `Type` = `individual`
-   - `Choices[0]` = { `Provider`: `com.apple.wallpaper.choice.aerials`, `Configuration`: 二进制 plist `["assetID": E0685AC0-67EB-449F-935D-2C9B95149026]`, `Files`: [] }
-   - 删除 `EncodedOptionValues`,`Shuffle` = `$null`
-3. 重启 agent:`launchctl stop com.apple.wallpaper.agent` + `pkill -f WallpaperAgent|WallpaperAerialsExtension` + `launchctl start com.apple.wallpaper.agent`
-4. 验证:8181 服务日志是否出现 `mwi_test4.mov` 拉流;壁纸实际变化(截图);Index.plist 是否被系统回写
-5. 恢复基线 + commit
-
-### 结果
-
-(待执行)
-
-### 恢复至基线
-
-- 恢复操作:恢复备份的 Index.plist / entries.json + 重启 agent
-- 完成:待执行
-- 差异说明:待执行
+| 日期 | 2026-08-30;git @ 30c74e5 |
+| 壁纸 | image choice |
+| videos/ | 8 个系统 mov |
+| override | 已清 |
+| 8181 | 已停 |

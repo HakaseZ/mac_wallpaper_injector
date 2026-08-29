@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""实验 001:向 Index.plist 注入 aerials choice(复刻 livid setWallpaper)。
+
+用法:python3 scripts/inject_exp001.py [--restore]
+  --restore: 从 backup/exp001/Index.plist.baseline 恢复基线
+"""
+import datetime
+import plistlib
+import shutil
+import sys
+from pathlib import Path
+
+INDEX = Path.home() / "Library/Application Support/com.apple.wallpaper/Store/Index.plist"
+BACKUP = Path(__file__).resolve().parent.parent / "backup/exp001/Index.plist.baseline"
+ASSET_ID = "E0685AC0-67EB-449F-935D-2C9B95149026"
+CONTAINERS = ["Desktop", "Idle", "Linked"]
+
+
+def load(path: Path) -> dict:
+    with open(path, "rb") as f:
+        return plistlib.load(f)
+
+
+def save(path: Path, plist: dict) -> None:
+    with open(path, "wb") as f:
+        plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
+
+
+def inject(node: dict, config: bytes) -> None:
+    """livid updateContentNode + inject:容器层注入 aerials choice。"""
+    node["Type"] = "individual"
+    content = node.get("Content")
+    if content is None:
+        content = {}
+        node["Content"] = content
+    choices = content.get("Choices") or [{}]
+    if not choices:
+        choices = [{}]
+    choices[0]["Provider"] = "com.apple.wallpaper.choice.aerials"
+    choices[0]["Configuration"] = config
+    choices[0]["Files"] = []
+    content["Choices"] = choices
+    content["Shuffle"] = "$null"
+    content.pop("EncodedOptionValues", None)
+
+
+def main() -> None:
+    if "--restore" in sys.argv:
+        shutil.copy2(BACKUP, INDEX)
+        print(f"restored: {BACKUP} -> {INDEX}")
+        return
+
+    if not BACKUP.exists():
+        sys.exit("missing baseline backup, refusing to inject")
+
+    plist = load(INDEX)
+    config = plistlib.dumps({"assetID": ASSET_ID}, fmt=plistlib.FMT_BINARY)
+    now = datetime.datetime.now()
+
+    for target in ["AllSpacesAndDisplays", "SystemDefault"]:
+        if target not in plist:
+            print(f"skip missing target: {target}")
+            continue
+        for container in CONTAINERS:
+            if container in plist[target]:
+                inject(plist[target][container], config)
+                plist[target][container]["LastSet"] = now
+                print(f"injected: {target}.{container}")
+
+    save(INDEX, plist)
+    print(f"saved: {INDEX}")
+
+
+if __name__ == "__main__":
+    main()
