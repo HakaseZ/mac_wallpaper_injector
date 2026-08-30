@@ -240,8 +240,12 @@ def cmd_refresh(_args) -> None:
 def cmd_select(args) -> None:
     st = load_json(STATE) if STATE.exists() else {}
     name = args.name or st.get("name")
+    if not name and getattr(args, "id", None):
+        d = load_json(ENTRIES) if ENTRIES.exists() else {}
+        a = next((x for x in d.get("assets", []) if x["id"] == args.id), None)
+        name = a.get("localizedNameKey") if a else None
     if not name:
-        sys.exit("no asset name (run prepare first or pass --name)")
+        sys.exit("no asset name (run prepare first or pass --name/--id)")
     log(f"selecting '{name}' in wallpaper panel...")
     r = run(["swift", str(ROOT / "scripts/ax_select.swift"), name], check=False)
     print(r.stdout.strip())
@@ -249,7 +253,7 @@ def cmd_select(args) -> None:
         sys.exit(f"asset '{name}' not found in panel (check entries.json + refresh)")
 
 
-def cmd_status(_args) -> None:
+def cmd_status(args) -> None:
     st = load_json(STATE) if STATE.exists() else {}
     aid = st.get("asset_id", "")
     r = subprocess.run(
@@ -264,10 +268,61 @@ def cmd_status(_args) -> None:
         "looping": out.count("startReading callback: success") >= 2,
         "snapshot": "Snapshot succeeded" in out,
     }
+    if getattr(args, "json", False):
+        import json as _json
+        print(_json.dumps({
+            "asset_id": aid,
+            "name": st.get("name", ""),
+            **checks,
+            "playing": bool(checks["downloaded"] and (checks["snapshot"] or checks["looping"])),
+        }))
+        return
     for k, v in checks.items():
         print(f"  {k}: {'✅' if v else '❌'}")
     ok = checks["downloaded"] and (checks["snapshot"] or checks["looping"])
     print("PLAYING ✅" if ok else "NOT PLAYING ❌(check refresh/select)")
+
+
+def cmd_list(args) -> None:
+    """列出注入资产(url 指向本地 127.0.0.1 的 entries 资产)+ 当前 choice"""
+    import json as _json
+    d = load_json(ENTRIES) if ENTRIES.exists() else {}
+    assets = d.get("assets", [])
+    cats = {c["id"]: c.get("localizedNameKey", c["id"]) for c in d.get("categories", [])}
+    injected = []
+    for a in assets:
+        url = a.get("url", "") or ""
+        url4k = a.get("url-4K-SDR-240FPS", "") or ""
+        if "127.0.0.1" in url or "127.0.0.1" in url4k:
+            cat_names = [cats.get(c, c[:8]) for c in a.get("categories", [])]
+            injected.append({
+                "id": a["id"],
+                "name": a.get("localizedNameKey", ""),
+                "categories": cat_names,
+                "subcategories": [s[:8] for s in a.get("subcategories", [])],
+                "url": url or url4k,
+                "downloaded": (Path.home() / "Library/Application Support/com.apple.wallpaper/aerials/videos" / f"{a['id']}.mov").exists(),
+            })
+    # 当前 choice
+    choice = {}
+    try:
+        with open(INDEX, "rb") as f:
+            idx = plistlib.load(f)
+        ch = idx.get("AllSpacesAndDisplays", {}).get("Desktop", {}).get("Content", {}).get("Choices", [{}])[0]
+        cfg = ch.get("Configuration", b"")
+        choice = plistlib.loads(cfg) if cfg else {}
+    except Exception:
+        pass
+    out = {"injected": injected, "choice": choice}
+    if getattr(args, "json", False):
+        print(_json.dumps(out))
+        return
+    if not injected:
+        print("(no injected assets)")
+    for a in injected:
+        mark = "⬇" if a["downloaded"] else "·"
+        print(f"  {mark} {a['name']}  [{','.join(a['categories'])}]  {a['id'][:8]}")
+    print("choice:", choice)
 
 
 def cmd_restore(_args) -> None:
@@ -323,8 +378,13 @@ def main() -> None:
     p.add_argument("--port", type=int, default=8181)
     p.add_argument("--no-patch", action="store_true")
     sub.add_parser("refresh", help="clear host cache + restart agent + open panel")
-    sub.add_parser("select").add_argument("--name")
-    sub.add_parser("status", help="check playback logs")
+    p_sel = sub.add_parser("select")
+    p_sel.add_argument("--name")
+    p_sel.add_argument("--id")
+    p_status = sub.add_parser("status", help="check playback logs")
+    p_status.add_argument("--json", action="store_true")
+    p_list = sub.add_parser("list", help="list injected assets")
+    p_list.add_argument("--json", action="store_true")
     sub.add_parser("restore", help="restore baseline")
     args = ap.parse_args()
     globals()[f"cmd_{args.cmd}"](args)
