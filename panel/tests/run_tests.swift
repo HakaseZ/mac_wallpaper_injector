@@ -28,8 +28,13 @@ struct RunTests {
 
     static func main() async {
         let svc = WallpaperService.shared
-        let v3 = URL(fileURLWithPath: "__REPO__/test_videos/mwi_test3_patched.mov")
-        let thumb = URL(fileURLWithPath: "__REPO__/test_videos/mwi_test4.png")
+        // 工程根由源码位置推导(不硬编码本地路径)
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // tests/
+            .deletingLastPathComponent()  // panel
+            .deletingLastPathComponent()  // 根
+        let v3 = root.appendingPathComponent("test_videos/mwi_test3_patched.mov")
+        let thumb = root.appendingPathComponent("test_videos/mwi_test4.png")
         print("== MWI 面板自动化测试 ==")
         do {
             // 0. 基线
