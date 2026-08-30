@@ -12,7 +12,8 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
     private var busy = false
     private var progressRowVisible = false
     private var transcodingProgress: [String: Double] = [:]  // 资产名 → 转码进度(支持并发)
-    private weak var transcodingItem: AssetCardItem?
+    private var transcodingItems: [String: AssetCardItem] = [:]  // 资产名 → 卡片(各自更新进度)
+    private var pendingAssets: [String: InjectedAsset] = [:]  // 转码中资产(刷新/完成 reload 时保留)
 
     // 视图
     private let collectionView = NSCollectionView()
@@ -58,7 +59,7 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
         // 左:缩略图网格(壁纸面板式排列:分类分组,左对齐,卡片完整缩略图)
         let listScroll = NSScrollView()
         let layout = NSCollectionViewFlowLayout()
-        layout.itemSize = NSSize(width: 168, height: 168)
+        layout.itemSize = NSSize(width: 168, height: 102)
         layout.sectionInset = NSEdgeInsets(top: 4, left: 8, bottom: 7, right: 8)
         layout.minimumInteritemSpacing = 10
         layout.minimumLineSpacing = 8
@@ -147,7 +148,12 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
         Task {
             let svc = WallpaperService.shared
             let (list, st) = await (svc.list(), svc.status())
-            self.assets = list
+            // 合并转码中资产(刷新/其他注入完成时保留进行中的卡片)
+            var merged = list
+            for (_, pa) in self.pendingAssets where !merged.contains(where: { $0.id == pa.id }) {
+                merged.append(pa)
+            }
+            self.assets = merged
             self.status = st
             self.rebuildGroups()
                 self.collectionView.reloadData()
@@ -239,10 +245,11 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
             } else if let p = try? ThumbnailExtractor.extractFrame(from: video).path {
                 thumbPath = p
             }
-            let pending = InjectedAsset(id: "pending", name: name,
+            let pending = InjectedAsset(id: "pending-\(UUID().uuidString)", name: name,
                                         categories: [newCat ?? "注入中"], subcategories: [],
                                         url: "", downloaded: false, thumb: thumbPath)
             await MainActor.run {
+                self.pendingAssets[name] = pending
                 self.assets = [pending] + self.assets
                 self.rebuildGroups()
                 self.collectionView.reloadData()
@@ -258,7 +265,8 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
                     _ = s  // 阶段提示由卡片进度条承载
                 case .progress(let p):
                     self.transcodingProgress[name] = p
-                    if let item = self.transcodingItem {
+                    if let item = self.transcodingItems[name] {
+                        item.progressRing.strokeEnd = p
                         item.pctLabel.stringValue = "\(Int(p * 100))%"
                     }
                 case .log(let s):
@@ -271,7 +279,8 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
                 }
             }
             self.transcodingProgress.removeValue(forKey: name)
-            self.transcodingItem = nil
+            self.transcodingItems.removeValue(forKey: name)
+            self.pendingAssets.removeValue(forKey: name)
             self.appendLog("prepare \(name):\n\(finalLog)")
             self.appendLog("refresh: 重查面板模型...")
             do {
@@ -334,6 +343,9 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
                 self.assets = await svc.list()
                 self.status = await svc.status()
                 self.rebuildGroups()
+                self.pendingAssets.removeAll()
+                self.transcodingProgress.removeAll()
+                self.transcodingItems.removeAll()
                 self.collectionView.reloadData()
                             } catch {
 
@@ -378,7 +390,9 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
         let prog = transcodingProgress[asset.name]
         item.configure(asset: asset, progress: prog)
         if prog != nil {
-            transcodingItem = item
+            transcodingItems[asset.name] = item
+        } else {
+            transcodingItems.removeValue(forKey: asset.name)
         }
         return item
     }
@@ -398,12 +412,14 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
             return
         }
         selectedID = groups[ip.section].items[ip.item].id
-        selectButton.isEnabled = !busy && selectedID != nil
+        selectButton.isEnabled = selectedID != nil
+        deleteButton.isEnabled = selectedID != nil
     }
 
     func collectionView(_ collectionView: NSCollectionView, didDeselectItemsAt indexPaths: Set<IndexPath>) {
         selectedID = nil
         selectButton.isEnabled = false
+        deleteButton.isEnabled = false
     }
 }
 
@@ -416,9 +432,19 @@ final class AssetCardItem: NSCollectionViewItem {
     private let ringContainer = NSView()             // 缩略图右上:环形进度(仿 wallpaper 下载蓝圈)
     private let ringLayer = CAShapeLayer()           // 背景环
     let progressRing = CAShapeLayer()                // 蓝色进度环(外部更新 strokeEnd)
+    private let imgContainer = NSView()              // 缩略图容器(选中蓝框只画在此,不超卡片)
+
+    override var isSelected: Bool {
+        didSet {
+            imgContainer.wantsLayer = true
+            imgContainer.layer?.borderWidth = isSelected ? 2 : 0
+            imgContainer.layer?.borderColor = isSelected ? NSColor.controlAccentColor.cgColor : nil
+            imgContainer.layer?.cornerRadius = 6
+        }
+    }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 168, height: 118))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 168, height: 100))
     }
 
     override func viewDidLoad() {
@@ -432,16 +458,19 @@ final class AssetCardItem: NSCollectionViewItem {
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.font = .systemFont(ofSize: 12)
 
-        // 环形进度:白色半透明背景环 + 系统蓝进度环(仿 wallpaper 下载)
+        // 环形进度:深色背景环 + 系统蓝进度环(仿 wallpaper 下载;强化对比)
+        let ringFrame = CGRect(x: 0, y: 0, width: 16, height: 16)
         let circle = NSBezierPath(ovalIn: CGRect(x: 1.5, y: 1.5, width: 13, height: 13)).cgPath
+        ringLayer.frame = ringFrame  // 设置 frame:保证旋转中心正确、与进度环对齐
         ringLayer.path = circle
-        ringLayer.strokeColor = NSColor.white.withAlphaComponent(0.45).cgColor
+        ringLayer.strokeColor = NSColor.black.withAlphaComponent(0.6).cgColor  // 深色底,对比明显
         ringLayer.fillColor = nil
-        ringLayer.lineWidth = 2.5
+        ringLayer.lineWidth = 3
+        progressRing.frame = ringFrame
         progressRing.path = circle
         progressRing.strokeColor = NSColor.systemBlue.cgColor
         progressRing.fillColor = nil
-        progressRing.lineWidth = 2.5
+        progressRing.lineWidth = 3
         progressRing.lineCap = .round
         progressRing.strokeEnd = 0
         progressRing.transform = CATransform3DMakeRotation(-.pi / 2, 0, 0, 1)  // 从 12 点方向开始
@@ -459,7 +488,6 @@ final class AssetCardItem: NSCollectionViewItem {
         pctLabel.isHidden = true
 
         // 缩略图容器(叠加环/百分比)
-        let imgContainer = NSView()
         imgContainer.wantsLayer = true
         imgContainer.layer?.cornerRadius = 6
         imgContainer.layer?.masksToBounds = true
@@ -496,7 +524,7 @@ final class AssetCardItem: NSCollectionViewItem {
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             stack.topAnchor.constraint(equalTo: view.topAnchor),
             imgContainer.widthAnchor.constraint(equalToConstant: 168),
-            imgContainer.heightAnchor.constraint(equalToConstant: 94),  // 16:9 完整显示
+            imgContainer.heightAnchor.constraint(equalToConstant: 78),  // 16:9 紧凑显示
             nameLabel.widthAnchor.constraint(equalToConstant: 168),
         ])
     }
