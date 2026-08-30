@@ -59,7 +59,7 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
         // 左:缩略图网格(壁纸面板式排列:分类分组,左对齐,卡片完整缩略图)
         let listScroll = NSScrollView()
         let layout = NSCollectionViewFlowLayout()
-        layout.itemSize = NSSize(width: 168, height: 168)
+        layout.itemSize = NSSize(width: 160, height: 144)
         layout.sectionInset = NSEdgeInsets(top: 4, left: 8, bottom: 7, right: 8)
         layout.minimumInteritemSpacing = 10
         layout.minimumLineSpacing = 8
@@ -432,26 +432,26 @@ final class AssetCardItem: NSCollectionViewItem {
     private let ringContainer = NSView()             // 缩略图右上:环形进度(仿 wallpaper 下载蓝圈)
     private let ringLayer = CAShapeLayer()           // 背景环
     let progressRing = CAShapeLayer()                // 蓝色进度环(外部更新 strokeEnd)
+    private let imgContainer = NSView()              // 缩略图容器(选中蓝框只画在此,不超卡片)
 
     override var isSelected: Bool {
         didSet {
-            view.wantsLayer = true
-            view.layer?.borderWidth = isSelected ? 2 : 0
-            view.layer?.borderColor = isSelected ? NSColor.controlAccentColor.cgColor : nil
-            view.layer?.cornerRadius = 7
+            imgContainer.wantsLayer = true
+            imgContainer.layer?.borderWidth = isSelected ? 2 : 0
+            imgContainer.layer?.borderColor = isSelected ? NSColor.controlAccentColor.cgColor : nil
+            imgContainer.layer?.cornerRadius = 6
         }
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 168, height: 118))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 160, height: 144))
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        // 裁切填充(aspect fill),无黑边
-        imgView.imageScaling = .scaleAxesIndependently
+        // 方形缩略图(configure 里裁剪居中方形,等比显示不变形)
+        imgView.imageScaling = .scaleProportionallyUpOrDown
         imgView.wantsLayer = true
-        imgView.layer?.contentsGravity = .resizeAspectFill
         imgView.layer?.cornerRadius = 6
         imgView.layer?.masksToBounds = true
         nameLabel.lineBreakMode = .byTruncatingTail
@@ -487,7 +487,6 @@ final class AssetCardItem: NSCollectionViewItem {
         pctLabel.isHidden = true
 
         // 缩略图容器(叠加环/百分比)
-        let imgContainer = NSView()
         imgContainer.wantsLayer = true
         imgContainer.layer?.cornerRadius = 6
         imgContainer.layer?.masksToBounds = true
@@ -523,9 +522,9 @@ final class AssetCardItem: NSCollectionViewItem {
             stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             stack.topAnchor.constraint(equalTo: view.topAnchor),
-            imgContainer.widthAnchor.constraint(equalToConstant: 168),
-            imgContainer.heightAnchor.constraint(equalToConstant: 94),  // 16:9 完整显示
-            nameLabel.widthAnchor.constraint(equalToConstant: 168),
+            imgContainer.widthAnchor.constraint(equalToConstant: 160),
+            imgContainer.heightAnchor.constraint(equalToConstant: 100),  // 16:10 壁纸比例
+            nameLabel.widthAnchor.constraint(equalToConstant: 160),
         ])
     }
 
@@ -544,12 +543,40 @@ final class AssetCardItem: NSCollectionViewItem {
         if !asset.thumb.isEmpty {
             Task {
                 let img = NSImage(contentsOfFile: asset.thumb)
-                await MainActor.run { self.imgView.image = img }
+                await MainActor.run { self.imgView.image = img.map(Self.cropSquare) }
             }
         } else {
             imgView.image = NSImage(systemSymbolName: asset.downloaded ? "arrow.down.circle.fill" : "photo",
                                     accessibilityDescription: nil)
         }
+    }
+
+    /// 按壁纸面板比例重绘:裁剪与原图比例一致的区域(目标比例 108:100),缩放无变形
+    static func cropSquare(_ img: NSImage) -> NSImage {
+        let s = img.size
+        guard s.width > 0, s.height > 0,
+              let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return img }
+        // 目标比例:16:10(系统缩略图 214x130 ≈ 1.65:1;取 160x100)
+        let target = NSSize(width: 160, height: 100)
+        let targetRatio = target.width / target.height
+        // 从原图裁剪 targetRatio 区域(居中),保证缩放不变形
+        var cropRect: CGRect
+        if s.width / s.height > targetRatio {
+            // 原图更宽 → 裁宽
+            let w = s.height * targetRatio
+            cropRect = CGRect(x: (s.width - w) / 2, y: 0, width: w, height: s.height)
+        } else {
+            // 原图更高 → 裁高
+            let h = s.width / targetRatio
+            cropRect = CGRect(x: 0, y: (s.height - h) / 2, width: s.width, height: h)
+        }
+        guard let cropped = cg.cropping(to: cropRect) else { return img }
+        let out = NSImage(size: target)
+        out.lockFocus()
+        NSImage(cgImage: cropped, size: NSSize(width: cropRect.width, height: cropRect.height))
+            .draw(in: NSRect(origin: .zero, size: target))
+        out.unlockFocus()
+        return out
     }
 }
 
