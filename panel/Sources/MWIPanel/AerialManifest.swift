@@ -92,13 +92,6 @@ enum AerialManifest {
         try JSONFile.saveDict(fb, to: Paths.entries)
         log += "entries.json: \(assets.count) assets (injected \(name) = \(assetID.prefix(12)))\n"
 
-        // STATE
-        let state: [String: Any] = [
-            "name": name, "asset_id": assetID, "video": videoName,
-            "thumb": thumbName, "port": port,
-        ]
-        let data = try JSONSerialization.data(withJSONObject: state, options: [.prettyPrinted])
-        try data.write(to: Paths.state, options: .atomic)
         return log
     }
 
@@ -112,9 +105,13 @@ enum AerialManifest {
         })
         var injected: [InjectedAsset] = []
         for a in assets {
+            let id = (a["id"] as? String) ?? ""
             let url = (a["url"] as? String) ?? ""
             let url4k = (a["url-4K-SDR-240FPS"] as? String) ?? ""
-            if url.contains("127.0.0.1") || url4k.contains("127.0.0.1") {
+            // 注入资产 = 本地 url(127.0.0.1/file://)+ 非空 subcategories(真实注入特征;
+            // 基线残留 MWI Test4 subcategories=[] 不显示)
+            if (url.contains("127.0.0.1") || url4k.contains("127.0.0.1"))
+                && !((a["subcategories"] as? [String]) ?? []).isEmpty {
                 let catNames = (a["categories"] as? [String] ?? []).map { cats[$0] ?? String($0.prefix(8)) }
                 let id = (a["id"] as? String) ?? ""
                 let vf = Paths.videosDir.appendingPathComponent("\(id).mov")
