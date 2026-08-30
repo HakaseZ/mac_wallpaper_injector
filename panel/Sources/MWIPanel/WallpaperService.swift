@@ -83,8 +83,6 @@ final class HTTPServer {
 
 actor WallpaperService {
     static let shared = WallpaperService()
-    /// 全局转码门:并发注入时转码排队(总 CPU 限速 ≈ 单转码限速,不随并发数线性叠加)
-    private static let transcodeGate = DispatchSemaphore(value: 1)
     private var httpServer: HTTPServer?
 
     // MARK: list / status
@@ -261,12 +259,6 @@ actor WallpaperService {
 
     // MARK: prepare(异步,带进度)
 
-    struct PreparedFiles {
-        let assetID: String
-        let video: URL
-        let thumb: URL
-    }
-
     enum PrepareEvent {
         case stage(String)     // 阶段文本(转码/补丁/注入)
         case progress(Double)  // 0-1
@@ -275,21 +267,18 @@ actor WallpaperService {
         case error(String)
     }
 
-    /// 后台完整注入流程。
-    /// 转码/补丁/预置在 detached 并行执行(各自限速,互不阻塞);entries 写入走 actor 串行(避免并发覆盖丢资产)
+    /// 后台完整注入流程(转码在 detached 非隔离执行,不阻塞 actor/UI)
     func prepareStream(videoURL: URL, name: String, thumbnailURL: URL?, newCategory: String?) -> AsyncStream<PrepareEvent> {
         AsyncStream { continuation in
             Task {
                 do {
-                    let files = try await Task.detached(priority: .utility) {
-                        try WallpaperService.prepareFiles(
-                            videoURL: videoURL, thumbnailURL: thumbnailURL,
+                    let core = try await Task.detached(priority: .utility) {
+                        try WallpaperService.prepareCore(
+                            videoURL: videoURL, name: name, thumbnailURL: thumbnailURL, newCategory: newCategory,
                             stage: { continuation.yield(.stage($0)) },
                             progress: { continuation.yield(.progress($0)) })
                     }.value
-                    // 注入(actor 串行:并发 prepareStream 依次写 entries,不互相覆盖)
-                    let log = try await self.injectPrepared(files: files, name: name, newCategory: newCategory)
-                    continuation.yield(.done(log))
+                    continuation.yield(.done(core))
                 } catch {
                     continuation.yield(.error(error.localizedDescription))
                 }
@@ -298,33 +287,30 @@ actor WallpaperService {
         }
     }
 
-    /// entries 注入(actor 隔离 → 串行执行)
-    private func injectPrepared(files: PreparedFiles, name: String, newCategory: String?) throws -> String {
-        try AerialManifest.inject(assetID: files.assetID, name: name, newCategory: newCategory)
-    }
-
     /// 同步版本(测试/内部用)
     @discardableResult
     func prepare(videoURL: URL, name: String, thumbnailURL: URL?, newCategory: String?) throws -> String {
-        let files = try WallpaperService.prepareFiles(
-            videoURL: videoURL, thumbnailURL: thumbnailURL, stage: { _ in }, progress: { _ in })
-        return try injectPrepared(files: files, name: name, newCategory: newCategory)
+        let core = try WallpaperService.prepareCore(
+            videoURL: videoURL, name: name, thumbnailURL: thumbnailURL, newCategory: newCategory,
+            stage: { _ in }, progress: { _ in })
+        return core
     }
 
-    /// 非隔离核心:转码(限速+进度)→ 补丁 → 预置 videos/thumbnails(不写 entries,并发安全)
-    private static func prepareFiles(videoURL: URL, thumbnailURL: URL?,
-                                     stage: @escaping @Sendable (String) -> Void,
-                                     progress: @escaping @Sendable (Double) -> Void) throws -> PreparedFiles {
+    /// 非隔离核心:转码(限速+进度)→ 补丁 → 复制 → 缩略图 → entries 注入
+    private static func prepareCore(videoURL: URL, name: String, thumbnailURL: URL?, newCategory: String?,
+                                    stage: @escaping @Sendable (String) -> Void,
+                                    progress: @escaping @Sendable (Double) -> Void) throws -> String {
+        let port = Paths.defaultPort
         let assetID = UUID().uuidString.uppercased()
         let fm = FileManager.default
+        var log = ""
 
-        // 0. 编码检测:非 HEVC(hvc1/hev1)→ ffmpeg 转码(总限速:全局门排队,总 CPU 不叠加)
+        // 0. 编码检测:非 HEVC(hvc1/hev1)→ ffmpeg 转码(aerials 解码器仅支持 HEVC)
         var video = videoURL
         if let codec = MOVPatcher.codecOf(video), codec != "hvc1", codec != "hev1" {
             stage("转码 HEVC 中(后台限速,避免发热)...")
+            log += "codec \(codec) 非 HEVC,ffmpeg 转码中(HEVC 10bit)...\n"
             let tmp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString + "_mwi.mov")
-            transcodeGate.wait()  // 排队:同时最多一个转码 → 总 CPU 限速
-            defer { transcodeGate.signal() }
             try runFFmpegTranscode(input: video, output: tmp, progress: progress)
             video = tmp
         } else {
@@ -361,7 +347,11 @@ actor WallpaperService {
         let destThumb = Paths.thumbnailsDir.appendingPathComponent("\(assetID).png")
         try? fm.removeItem(at: destThumb)
         try fm.copyItem(at: thumbURL, to: destThumb)
-        return PreparedFiles(assetID: assetID, video: video, thumb: destThumb)
+
+        // 4. entries 注入
+        stage("写入 entries.json")
+        log += try AerialManifest.inject(assetID: assetID, name: name, newCategory: newCategory)
+        return log
     }
 
     /// 调 ffmpeg 转码为 aerials 合规 HEVC 10bit(非隔离,detached 可调用)。

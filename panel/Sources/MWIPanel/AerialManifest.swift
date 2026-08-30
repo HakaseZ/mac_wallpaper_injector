@@ -11,11 +11,11 @@ enum AerialManifest {
         JSONFile.loadDict(Paths.entries)
     }
 
-    /// 注入准备:构造资产 + 新分类(可选),写用户 entries.json,备份,写 STATE
+    /// 注入准备:构造资产 + 新分类(可选),写用户 entries.json,备份
+    /// 下载源 = file://(视频/缩略图已预置到 aerials/videos|thumbnails,不依赖 http/代理)
     /// - Returns: 日志文本
     @discardableResult
-    static func inject(videoName: String, thumbName: String, port: Int,
-                       name: String, assetID: String, newCategory: String?) throws -> String {
+    static func inject(assetID: String, name: String, newCategory: String?) throws -> String {
         var fb = loadFallback()
         guard let landscape = (fb["categories"] as? [[String: Any]])?.first(where: { $0["id"] as? String == Paths.landscapeCatID }),
               let template = (fb["assets"] as? [[String: Any]])?.first(where: { $0["id"] as? String == Paths.templateAssetID }) else {
@@ -51,18 +51,20 @@ enum AerialManifest {
             log += "new category: \(newCategory) = \(catID.prefix(12))(独立,全新子分类)\n"
         }
 
-        // 资产(克隆模板 + 覆盖字段)
+        // 资产(克隆模板 + 覆盖字段);下载源 = file:// 本地(避开系统代理干扰)
+        let videoFile = Paths.videosDir.appendingPathComponent("\(assetID).mov").absoluteString
+        let thumbFile = Paths.thumbnailsDir.appendingPathComponent("\(assetID).png").absoluteString
         var asset = template
         asset["id"] = assetID
         asset["localizedNameKey"] = name
         asset["accessibilityLabel"] = name
-        asset["previewImage"] = "http://127.0.0.1:\(port)/\(thumbName)"
+        asset["previewImage"] = thumbFile
         asset["categories"] = [catID]
         if let newSGID {
             asset["subcategories"] = [newSGID]
         }
-        asset["url"] = "http://127.0.0.1:\(port)/\(videoName)"
-        asset["url-4K-SDR-240FPS"] = "http://127.0.0.1:\(port)/\(videoName)"
+        asset["url"] = videoFile
+        asset["url-4K-SDR-240FPS"] = videoFile
 
         // 备份用户 entries(仅首次)
         if FileManager.default.fileExists(atPath: Paths.entries.path) {
@@ -110,17 +112,23 @@ enum AerialManifest {
             let url4k = (a["url-4K-SDR-240FPS"] as? String) ?? ""
             // 注入资产 = 本地 url(127.0.0.1/file://)+ 非空 subcategories(真实注入特征;
             // 基线残留 MWI Test4 subcategories=[] 不显示)
-            if (url.contains("127.0.0.1") || url4k.contains("127.0.0.1"))
-                && !((a["subcategories"] as? [String]) ?? []).isEmpty {
+            let localURL = url.contains("127.0.0.1") || url4k.contains("127.0.0.1")
+                || url.hasPrefix("file://") || url4k.hasPrefix("file://")
+            if localURL && !((a["subcategories"] as? [String]) ?? []).isEmpty {
                 let catNames = (a["categories"] as? [String] ?? []).map { cats[$0] ?? String($0.prefix(8)) }
                 let id = (a["id"] as? String) ?? ""
                 let vf = Paths.videosDir.appendingPathComponent("\(id).mov")
-                // 缩略图:previewImage(http://127.0.0.1:8181/xxx.png)→ 本地 httpDir
+                // 缩略图:previewImage 文件名 → httpDir(旧)或 thumbnails(新)找本地文件
                 var thumb = ""
                 let preview = (a["previewImage"] as? String) ?? ""
                 if let tn = preview.components(separatedBy: "/").last, !tn.isEmpty {
-                    let tp = Paths.httpDir.appendingPathComponent(tn).path
-                    if FileManager.default.fileExists(atPath: tp) { thumb = tp }
+                    for dir in [Paths.httpDir, Paths.thumbnailsDir] {
+                        let tp = dir.appendingPathComponent(tn).path
+                        if FileManager.default.fileExists(atPath: tp) {
+                            thumb = tp
+                            break
+                        }
+                    }
                 }
                 injected.append(InjectedAsset(
                     id: id,
