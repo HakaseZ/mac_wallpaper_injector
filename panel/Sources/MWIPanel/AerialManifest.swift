@@ -17,6 +17,29 @@ enum AerialManifest {
     @discardableResult
     static func inject(assetID: String, name: String, newCategory: String?) throws -> String {
         var fb = loadFallback()
+        // 保留 entries 中已有的注入资产及其分类(多次注入不互相覆盖)
+        let current = loadEntries()
+        let curAssets = current["assets"] as? [[String: Any]] ?? []
+        let curCats = current["categories"] as? [[String: Any]] ?? []
+        let injectedNow = curAssets.filter { a in
+            let u = (a["url"] as? String) ?? ""
+            let u4 = (a["url-4K-SDR-240FPS"] as? String) ?? ""
+            return u.contains("127.0.0.1") || u4.contains("127.0.0.1")
+                || u.hasPrefix("file://") || u4.hasPrefix("file://")
+        }
+        var fbAssets = fb["assets"] as? [[String: Any]] ?? []
+        for a in injectedNow where !fbAssets.contains(where: { ($0["id"] as? String) == (a["id"] as? String) }) {
+            fbAssets.append(a)
+        }
+        fb["assets"] = fbAssets
+        // 注入资产引用的非 fallback 分类(保留)
+        let fbCatIDs = Set((fb["categories"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String })
+        var fbCats = fb["categories"] as? [[String: Any]] ?? []
+        for c in curCats {
+            guard let cid = c["id"] as? String, !fbCatIDs.contains(cid) else { continue }
+            let used = injectedNow.contains { ((($0["categories"] as? [String]) ?? []).contains(cid)) }
+            if used { fbCats.append(c); fb["categories"] = fbCats }
+        }
         guard let landscape = (fb["categories"] as? [[String: Any]])?.first(where: { $0["id"] as? String == Paths.landscapeCatID }),
               let template = (fb["assets"] as? [[String: Any]])?.first(where: { $0["id"] as? String == Paths.templateAssetID }) else {
             throw ServiceError.msg("fallback 缺 Landscape 分类或模板资产")
@@ -26,29 +49,39 @@ enum AerialManifest {
         var catID: String = Paths.landscapeCatID
         var newSGID: String?
 
-        // 新分类(克隆 Landscape + 全新子分类)
+        // 新分类(克隆 Landscape + 全新子分类);同名分类复用(避免重复创建)
         if let newCategory, !newCategory.isEmpty {
-            var newCat = landscape
-            newCat["id"] = UUID().uuidString.uppercased()
-            newCat["localizedNameKey"] = newCategory
-            // 全新子分类(克隆 Golden Gate 结构)→ 分类完全独立
-            let sgList = landscape["subcategories"] as? [[String: Any]] ?? []
-            guard let goldenGate = sgList.first(where: { $0["id"] as? String == Paths.goldenGateSubID }) else {
-                throw ServiceError.msg("fallback 缺 Golden Gate 子分类")
+            let existing = (fb["categories"] as? [[String: Any]])?.first {
+                ($0["localizedNameKey"] as? String) == newCategory
             }
-            var newSG = goldenGate
-            newSG["id"] = UUID().uuidString.uppercased()
-            newSG["localizedNameKey"] = "\(newCategory) 子分类"
-            newSG["preferredOrder"] = 99
-            newSGID = newSG["id"] as? String
-            newCat["subcategories"] = [newSG]
-            // 替换/追加分类
-            var cats = fb["categories"] as? [[String: Any]] ?? []
-            cats.removeAll { ($0["id"] as? String) == newCat["id"] as? String }
-            cats.append(newCat)
-            fb["categories"] = cats
-            catID = newCat["id"] as! String
-            log += "new category: \(newCategory) = \(catID.prefix(12))(独立,全新子分类)\n"
+            if let existing, let eid = existing["id"] as? String {
+                catID = eid
+                let subs = (existing["subcategories"] as? [[String: Any]]) ?? []
+                newSGID = subs.first?["id"] as? String
+                log += "reuse category: \(newCategory) = \(catID.prefix(12))\n"
+            } else {
+                var newCat = landscape
+                newCat["id"] = UUID().uuidString.uppercased()
+                newCat["localizedNameKey"] = newCategory
+                // 全新子分类(克隆 Golden Gate 结构)→ 分类完全独立
+                let sgList = landscape["subcategories"] as? [[String: Any]] ?? []
+                guard let goldenGate = sgList.first(where: { $0["id"] as? String == Paths.goldenGateSubID }) else {
+                    throw ServiceError.msg("fallback 缺 Golden Gate 子分类")
+                }
+                var newSG = goldenGate
+                newSG["id"] = UUID().uuidString.uppercased()
+                newSG["localizedNameKey"] = "\(newCategory) 子分类"
+                newSG["preferredOrder"] = 99
+                newSGID = newSG["id"] as? String
+                newCat["subcategories"] = [newSG]
+                // 替换/追加分类
+                var cats = fb["categories"] as? [[String: Any]] ?? []
+                cats.removeAll { ($0["id"] as? String) == newCat["id"] as? String }
+                cats.append(newCat)
+                fb["categories"] = cats
+                catID = newCat["id"] as! String
+                log += "new category: \(newCategory) = \(catID.prefix(12))(独立,全新子分类)\n"
+            }
         }
 
         // 资产(克隆模板 + 覆盖字段);下载源 = file:// 本地(避开系统代理干扰)
