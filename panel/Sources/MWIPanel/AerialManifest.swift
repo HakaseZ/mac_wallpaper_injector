@@ -177,8 +177,10 @@ enum AerialManifest {
         // choice
         var choice: [String: String] = [:]
         let idx = PList.loadDict(Paths.index)
-        if let ch = ((idx["AllSpacesAndDisplays"] as? [String: Any])?["Desktop"] as? [String: Any])?["Content"] as? [String: Any],
-           let choices = ch["Choices"] as? [[String: Any]], let first = choices.first {
+        let allASD = idx["AllSpacesAndDisplays"] as? [String: Any] ?? [:]
+        let content = (allASD["Desktop"] as? [String: Any])?["Content"] as? [String: Any]
+            ?? (allASD["Linked"] as? [String: Any])?["Content"] as? [String: Any]
+        if let ch = content, let choices = ch["Choices"] as? [[String: Any]], let first = choices.first {
             let cfg = first["Configuration"] as? Data
             if let cfg, let c = try? PropertyListSerialization.propertyList(from: cfg, options: [], format: nil) as? [String: Any] {
                 choice = c.compactMapValues { String(describing: $0) }

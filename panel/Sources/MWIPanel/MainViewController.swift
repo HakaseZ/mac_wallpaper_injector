@@ -302,7 +302,7 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
         guard let asset = assets.first(where: { $0.id == id }) else { return }
         let alert = NSAlert()
         alert.messageText = "删除资产?"
-        alert.informativeText = "将从 entries 移除 \(asset.name),并删除其视频/缩略图。若它是当前壁纸,choice 恢复 用户壁纸。"
+        alert.informativeText = "将从 entries 移除 \(asset.name),并删除其视频/缩略图。若它是当前壁纸,choice 恢复系统默认壁纸。"
         alert.addButton(withTitle: "删除")
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -330,7 +330,7 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
     @objc private func doRestore() {
         let alert = NSAlert()
         alert.messageText = "恢复基线?"
-        alert.informativeText = "将清理注入资产(entries/Index/视频/缩略图)并恢复 用户壁纸 壁纸。"
+        alert.informativeText = "将清理注入资产(entries/Index/视频/缩略图)并恢复系统默认壁纸。"
         alert.addButton(withTitle: "恢复")
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }

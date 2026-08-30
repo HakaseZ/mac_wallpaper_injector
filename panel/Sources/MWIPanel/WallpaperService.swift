@@ -243,15 +243,11 @@ actor WallpaperService {
                 }
             }
         }
-        // choice 指向它 → 恢复基线(用户壁纸)
+        // choice 指向它 → 恢复系统默认壁纸(非用户本地文件)
         let (_, choice) = AerialManifest.list()
         if choice["assetID"] == id {
-            let idxBase = Paths.exp009Baseline.appendingPathComponent("Index.plist.baseline")
-            if fm.fileExists(atPath: idxBase.path) {
-                try? fm.removeItem(at: Paths.index)
-                try fm.copyItem(at: idxBase, to: Paths.index)
-                log += "choice 恢复 用户壁纸\n"
-            }
+            try setSystemDefaultWallpaper()
+            log += "choice 恢复系统默认壁纸\n"
         }
         killAgent()
         return log + "deleted \(name)\(id.prefix(8))\n"
@@ -425,6 +421,35 @@ actor WallpaperService {
         httpServer = s
     }
 
+    /// 恢复出厂默认动态壁纸(亮/暗切换):系统 Desktop Pictures 的 Valley 动态壁纸
+    private func setSystemDefaultWallpaper() throws {
+        var idx = PList.loadDict(Paths.index)
+        let urlDict: [String: Any] = ["relative": "file:///System/Library/Desktop%20Pictures/Valley.madesktop"]
+        let cfg: [String: Any] = ["type": "imageFile", "url": urlDict]
+        var choice: [String: Any] = [:]
+        choice["Provider"] = "com.apple.wallpaper.choice.image"
+        choice["Configuration"] = try PropertyListSerialization.data(fromPropertyList: cfg, format: .xml, options: 0)
+        // 结构:AllSpacesAndDisplays.Linked.Content.Choices(macOS 27 实际结构)
+        if var all = idx["AllSpacesAndDisplays"] as? [String: Any],
+           var linked = all["Linked"] as? [String: Any],
+           var content = linked["Content"] as? [String: Any] {
+            content["Choices"] = [choice]
+            linked["Content"] = content
+            all["Linked"] = linked
+            idx["AllSpacesAndDisplays"] = all
+            try PList.saveDict(idx, to: Paths.index)
+        } else if var all = idx["AllSpacesAndDisplays"] as? [String: Any],
+                  var desktop = all["Desktop"] as? [String: Any],
+                  var content = desktop["Content"] as? [String: Any] {
+            // 兼容旧结构
+            content["Choices"] = [choice]
+            desktop["Content"] = content
+            all["Desktop"] = desktop
+            idx["AllSpacesAndDisplays"] = all
+            try PList.saveDict(idx, to: Paths.index)
+        }
+    }
+
     private func ensureHTTPServer() throws {
         if let s = httpServer, s.isRunning { return }
         try startHTTPServer(port: UInt16(Paths.defaultPort))
@@ -450,12 +475,9 @@ actor WallpaperService {
             try replace(baseline, Paths.entries)
             log += "entries.json restored (exp009 baseline)\n"
         }
-        // Index 恢复(exp009 baseline = 用户壁纸 image)
-        let idxBase = Paths.exp009Baseline.appendingPathComponent("Index.plist.baseline")
-        if fm.fileExists(atPath: idxBase.path) {
-            try replace(idxBase, Paths.index)
-            log += "Index.plist restored (用户壁纸)\n"
-        }
+        // 恢复系统默认壁纸(不再引用用户本地图片)
+        try setSystemDefaultWallpaper()
+        log += "Index.plist -> 系统默认壁纸\n"
         // 注入资产视频 + 缩略图(从 entries 收集,无 STATE 依赖)
         let (injected, _) = AerialManifest.list()
         for a in injected {

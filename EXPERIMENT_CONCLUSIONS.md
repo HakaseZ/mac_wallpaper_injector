@@ -433,7 +433,7 @@
 
 - **日期**:2026-08-30(用户澄清)
 - **恢复目标(exp009 基线)**:
-  - Index.plist:**image choice = 用户壁纸 用户图片**(非 default;面板操作曾改为 default,已恢复)
+  - Index.plist:**image choice = 用户图片(脱敏)**(非 default;面板操作曾改为 default,已恢复)
   - entries.json:1 资产(E0685AC0)
   - videos/:8 个系统 mov
   - override:无
@@ -474,4 +474,4 @@
   - 资产下载中 = AXProgressIndicator(desc=资产名,拦截点击),完成后恢复 AXButton
   - ax_select.swift(AX 树定位 + ScrollToVisible + 合成点击)在下载完成后可靠
 - **inject.py --new-category 工具**:prepare 支持 `--new-category NAME`(克隆 Landscape 模板→新分类,资产归入 + subcategories=67512508);验证链路 prepare→refresh→select→status→restore 全通
-- **恢复规范**:restore 后须用 backup/exp009/Index.plist.baseline 恢复 choice(image 用户壁纸)(prepare 时备份的 Index 可能含实验残留 choice,agent 重启会保留)
+- **恢复规范**:restore 恢复系统默认壁纸(不再引用用户本地图片)(prepare 时备份的 Index 可能含实验残留 choice,agent 重启会保留)
