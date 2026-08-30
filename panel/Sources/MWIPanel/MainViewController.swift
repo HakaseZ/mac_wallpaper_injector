@@ -59,7 +59,7 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
         // 左:缩略图网格(壁纸面板式排列:分类分组,左对齐,卡片完整缩略图)
         let listScroll = NSScrollView()
         let layout = NSCollectionViewFlowLayout()
-        layout.itemSize = NSSize(width: 168, height: 102)
+        layout.itemSize = NSSize(width: 168, height: 168)
         layout.sectionInset = NSEdgeInsets(top: 4, left: 8, bottom: 7, right: 8)
         layout.minimumInteritemSpacing = 10
         layout.minimumLineSpacing = 8
@@ -432,19 +432,18 @@ final class AssetCardItem: NSCollectionViewItem {
     private let ringContainer = NSView()             // 缩略图右上:环形进度(仿 wallpaper 下载蓝圈)
     private let ringLayer = CAShapeLayer()           // 背景环
     let progressRing = CAShapeLayer()                // 蓝色进度环(外部更新 strokeEnd)
-    private let imgContainer = NSView()              // 缩略图容器(选中蓝框只画在此,不超卡片)
 
     override var isSelected: Bool {
         didSet {
-            imgContainer.wantsLayer = true
-            imgContainer.layer?.borderWidth = isSelected ? 2 : 0
-            imgContainer.layer?.borderColor = isSelected ? NSColor.controlAccentColor.cgColor : nil
-            imgContainer.layer?.cornerRadius = 6
+            view.wantsLayer = true
+            view.layer?.borderWidth = isSelected ? 2 : 0
+            view.layer?.borderColor = isSelected ? NSColor.controlAccentColor.cgColor : nil
+            view.layer?.cornerRadius = 7
         }
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 168, height: 100))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 168, height: 118))
     }
 
     override func viewDidLoad() {
@@ -488,6 +487,7 @@ final class AssetCardItem: NSCollectionViewItem {
         pctLabel.isHidden = true
 
         // 缩略图容器(叠加环/百分比)
+        let imgContainer = NSView()
         imgContainer.wantsLayer = true
         imgContainer.layer?.cornerRadius = 6
         imgContainer.layer?.masksToBounds = true
@@ -524,7 +524,7 @@ final class AssetCardItem: NSCollectionViewItem {
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             stack.topAnchor.constraint(equalTo: view.topAnchor),
             imgContainer.widthAnchor.constraint(equalToConstant: 168),
-            imgContainer.heightAnchor.constraint(equalToConstant: 78),  // 16:9 紧凑显示
+            imgContainer.heightAnchor.constraint(equalToConstant: 94),  // 16:9 完整显示
             nameLabel.widthAnchor.constraint(equalToConstant: 168),
         ])
     }
