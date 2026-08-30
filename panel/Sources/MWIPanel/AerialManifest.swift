@@ -66,10 +66,20 @@ enum AerialManifest {
 
         // 备份用户 entries(仅首次)
         if FileManager.default.fileExists(atPath: Paths.entries.path) {
-            let backup = Paths.exp009Baseline.deletingLastPathComponent().appendingPathComponent("inject/entries.json")
-            try FileManager.default.createDirectory(at: backup.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let backupDir = Paths.exp009Baseline.deletingLastPathComponent().appendingPathComponent("inject")
+            let backup = backupDir.appendingPathComponent("entries.json")
+            log += "backupDir: \(backupDir.path)\n"
+            do {
+                try FileManager.default.createDirectory(at: backupDir, withIntermediateDirectories: true)
+            } catch {
+                throw ServiceError.msg("备份目录创建失败 \(backupDir.path): \(error.localizedDescription)")
+            }
             if !FileManager.default.fileExists(atPath: backup.path) {
-                try? FileManager.default.copyItem(at: Paths.entries, to: backup)
+                do {
+                    try FileManager.default.copyItem(at: Paths.entries, to: backup)
+                } catch {
+                    throw ServiceError.msg("备份复制失败 \(backup.path): \(error.localizedDescription)")
+                }
                 log += "entries.json backed up\n"
             }
         }

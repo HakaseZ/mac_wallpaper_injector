@@ -180,6 +180,19 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
     private func appendLog(_ s: String) {
         logView.textStorage?.append(NSAttributedString(string: s + "\n"))
         logView.scrollToEndOfDocument(nil)
+        // 落盘便于诊断
+        if let h = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first {
+            let logFile = h.appendingPathComponent("Logs/mwi_panel.log")
+            if let d = (s + "\n").data(using: .utf8) {
+                if let fh = try? FileHandle(forWritingTo: logFile) {
+                    fh.seekToEndOfFile()
+                    fh.write(d)
+                    try? fh.close()
+                } else {
+                    try? d.write(to: logFile)
+                }
+            }
+        }
     }
 
     // MARK: 操作
@@ -197,6 +210,8 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
                 self.status = await WallpaperService.shared.status()
                 self.updateStatusBar()
             } catch {
+
+                self.appendLog("ERROR(select): \(error.localizedDescription)")
                 self.showError(error.localizedDescription)
             }
             self.setBusy(false)
@@ -218,9 +233,14 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
                 let out = try await WallpaperService.shared.prepare(
                     videoURL: video, name: name, thumbnailURL: thumb, newCategory: newCat)
                 self.appendLog("prepare \(name):\n\(out)")
+                self.appendLog("refresh: 重查面板模型...")
+                let r = try await WallpaperService.shared.refresh()
+                self.appendLog(r)
                 self.assets = await WallpaperService.shared.list()
                 self.tableView.reloadData()
             } catch {
+
+                self.appendLog("ERROR(prepare): \(error.localizedDescription)")
                 self.showError(error.localizedDescription)
             }
             self.setBusy(false)
@@ -245,6 +265,8 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
                 self.tableView.reloadData()
                 self.updateStatusBar()
             } catch {
+
+                self.appendLog("ERROR(restore): \(error.localizedDescription)")
                 self.showError(error.localizedDescription)
             }
             self.setBusy(false)

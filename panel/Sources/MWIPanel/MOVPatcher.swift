@@ -286,6 +286,14 @@ enum MOVPatcher {
             }
         }
 
+        // 视频编码(stsd 首个 entry 4cc):csgm/sgpd 为 HEVC 时间分层专用,h264 等跳过
+        var isHEVC = false
+        if let stsd = stbl.find("stsd"), stsd.size >= 20 {
+            let codec = data.subdata(in: (stsd.offset + 16)..<(stsd.offset + 20))
+            let codecStr = String(data: codec, encoding: .ascii) ?? ""
+            isHEVC = (codecStr == "hvc1" || codecStr == "hev1")
+        }
+
         // 生成补丁 atom
         let tapt = buildTapt(w32: w32, h32: h32)
         let sgpdTscl = buildSgpdTscl(baseDuration: baseDuration)
@@ -306,7 +314,10 @@ enum MOVPatcher {
         var newStbl = Data()
         for a in stbl.children {
             if a.type == "stsd" {
-                newStbl += stblChildren["stsd"]! + sgpdTscl + sgpdTsas + csgmTscl + csgmTsas
+                newStbl += stblChildren["stsd"]!
+                if isHEVC {
+                    newStbl += sgpdTscl + sgpdTsas + csgmTscl + csgmTsas
+                }
             } else if a.type == "stco" && cslg != nil {
                 newStbl += cslg! + stblChildren["stco"]!
             } else if let c = stblChildren[a.type] {
@@ -350,10 +361,25 @@ enum MOVPatcher {
             }
         }
 
-        // rebuild moov
+        // rebuild moov:仅补丁目标 stbl(视频轨)用重排后的 newStbl;
+        // 其他轨(如音频)的 stbl 原样保留但 stco/co64 必须 +delta(全局 mdat 移位)
+        let targetStblOffset = stbl.offset
         func rebuild(_ a: Atom) -> Data {
             if a.type == "stbl" {
-                return be32(UInt32(8 + newStbl.count)) + "stbl".data(using: .ascii)! + newStbl
+                if a.offset == targetStblOffset {
+                    return be32(UInt32(8 + newStbl.count)) + "stbl".data(using: .ascii)! + newStbl
+                }
+                var body = Data()
+                for c in a.children {
+                    if c.type == "stco" {
+                        body += patchOffsets(c, elemSize: 4)
+                    } else if c.type == "co64" {
+                        body += patchOffsets(c, elemSize: 8)
+                    } else {
+                        body += atomBytes(c)
+                    }
+                }
+                return be32(UInt32(8 + body.count)) + "stbl".data(using: .ascii)! + body
             }
             if !a.children.isEmpty {
                 var body = Data()

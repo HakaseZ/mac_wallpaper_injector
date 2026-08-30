@@ -197,26 +197,27 @@ actor WallpaperService {
             video = patched
         }
 
-        // 2. 缩略图(缺省 AVFoundation 抽帧)
-        var thumb = thumbnailURL
-        if thumb == nil {
-            let cand = video.deletingPathExtension().appendingPathExtension("png")
-            if fm.fileExists(atPath: cand.path) {
-                thumb = cand
-            } else {
-                thumb = try ThumbnailExtractor.extractFrame(from: video)
-            }
-        }
-        guard let thumb else { throw ServiceError.msg("no thumbnail available") }
-
-        // 3. 复制到 http 目录
+        // 2. 复制视频到 http 目录 + 缩略图(用户提供则复制;缺省 AVFoundation 抽帧直接写 httpDir)
         try fm.createDirectory(at: Paths.httpDir, withIntermediateDirectories: true)
         let videoName = video.lastPathComponent
-        let thumbName = thumb.lastPathComponent
         try? fm.removeItem(at: Paths.httpDir.appendingPathComponent(videoName))
-        try? fm.removeItem(at: Paths.httpDir.appendingPathComponent(thumbName))
         try fm.copyItem(at: video, to: Paths.httpDir.appendingPathComponent(videoName))
-        try fm.copyItem(at: thumb, to: Paths.httpDir.appendingPathComponent(thumbName))
+
+        var thumbName: String
+        if let thumb = thumbnailURL {
+            thumbName = thumb.lastPathComponent
+            try? fm.removeItem(at: Paths.httpDir.appendingPathComponent(thumbName))
+            try fm.copyItem(at: thumb, to: Paths.httpDir.appendingPathComponent(thumbName))
+        } else {
+            let cand = video.deletingPathExtension().appendingPathExtension("png")
+            if fm.fileExists(atPath: cand.path) {
+                thumbName = cand.lastPathComponent
+                try? fm.removeItem(at: Paths.httpDir.appendingPathComponent(thumbName))
+                try fm.copyItem(at: cand, to: Paths.httpDir.appendingPathComponent(thumbName))
+            } else {
+                thumbName = try ThumbnailExtractor.extractFrame(from: video).lastPathComponent
+            }
+        }
 
         // 4. entries 注入
         let log = try AerialManifest.inject(videoName: videoName, thumbName: thumbName, port: port,

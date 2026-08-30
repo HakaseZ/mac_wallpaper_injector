@@ -2,13 +2,15 @@
 # MWI 管理面板构建(CLT 无 SwiftUIMacros 插件,用 swiftc 直编替代 SwiftPM)
 set -e
 cd "$(dirname "$0")"
+DIR="$(pwd)"
 mkdir -p build/MWIPanel.app/Contents/MacOS
 
+# 绝对路径编译:保证 #filePath 为绝对路径(相对路径会让面板把工程根误解析为 /)
 xcrun swiftc -parse-as-library -O \
-  Sources/MWIPanel/Models.swift Sources/MWIPanel/MOVPatcher.swift \
-  Sources/MWIPanel/AerialManifest.swift Sources/MWIPanel/AXSelection.swift \
-  Sources/MWIPanel/WallpaperService.swift Sources/MWIPanel/main.swift Sources/MWIPanel/MainViewController.swift \
-  -o build/MWIPanel.app/Contents/MacOS/MWIPanel \
+  "$DIR/Sources/MWIPanel/Models.swift" "$DIR/Sources/MWIPanel/MOVPatcher.swift" \
+  "$DIR/Sources/MWIPanel/AerialManifest.swift" "$DIR/Sources/MWIPanel/AXSelection.swift" \
+  "$DIR/Sources/MWIPanel/WallpaperService.swift" "$DIR/Sources/MWIPanel/main.swift" "$DIR/Sources/MWIPanel/MainViewController.swift" \
+  -o "$DIR/build/MWIPanel.app/Contents/MacOS/MWIPanel" \
   -framework AppKit -framework ApplicationServices -framework CoreGraphics \
   -framework AVFoundation -framework UniformTypeIdentifiers -framework Network
 
@@ -47,5 +49,8 @@ cat > build/MWIPanel.app/Contents/Info.plist <<PLIST
 </plist>
 PLIST
 printf 'APPL????' > build/MWIPanel.app/Contents/PkgInfo
+
+# ad-hoc 签名:稳定 TCC 授权标识(重构建不丢权限)
+codesign --force --deep -s - build/MWIPanel.app 2>/dev/null
 
 echo "built: build/MWIPanel.app"
