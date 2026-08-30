@@ -167,6 +167,19 @@ enum MOVPatcher {
         return be32(UInt32(8 + body.count)) + "cslg".data(using: .ascii)! + body
     }
 
+    /// 读取视频轨编码 4cc(avc1/hvc1/...),供 prepare 判断是否需要转码
+    static func codecOf(_ url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let roots = parse(data, 0, data.count)
+        guard let moov = roots.first(where: { $0.type == "moov" }),
+              let trak = moov.find("trak"),
+              let mdia = trak.find("mdia"),
+              let minf = mdia.find("minf"),
+              let stbl = minf.find("stbl"),
+              let stsd = stbl.find("stsd"), stsd.size >= 20 else { return nil }
+        return String(data: data.subdata(in: (stsd.offset + 20)..<(stsd.offset + 24)), encoding: .ascii)
+    }
+
     // MARK: 主流程
 
     struct PatchError: LocalizedError {
@@ -289,7 +302,7 @@ enum MOVPatcher {
         // 视频编码(stsd 首个 entry 4cc):csgm/sgpd 为 HEVC 时间分层专用,h264 等跳过
         var isHEVC = false
         if let stsd = stbl.find("stsd"), stsd.size >= 20 {
-            let codec = data.subdata(in: (stsd.offset + 16)..<(stsd.offset + 20))
+            let codec = data.subdata(in: (stsd.offset + 20)..<(stsd.offset + 24))
             let codecStr = String(data: codec, encoding: .ascii) ?? ""
             isHEVC = (codecStr == "hvc1" || codecStr == "hev1")
         }

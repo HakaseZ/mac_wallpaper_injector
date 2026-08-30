@@ -4,20 +4,25 @@ import UniformTypeIdentifiers
 // MARK: - 主界面(AppKit)
 
 @MainActor
-final class MainViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+final class MainViewController: NSViewController, NSCollectionViewDataSource, NSCollectionViewDelegate {
     private var assets: [InjectedAsset] = []
+    private var groups: [(name: String, items: [InjectedAsset])] = []
     private var status: StatusInfo?
     private var selectedID: String?
     private var busy = false
+    private var progressRowVisible = false
+    private var transcodingProgress: [String: Double] = [:]  // 资产名 → 转码进度(支持并发)
+    private weak var transcodingItem: AssetCardItem?
 
     // 视图
-    private let tableView = NSTableView()
+    private let collectionView = NSCollectionView()
     private let logView = NSTextView()
-    private let statusLabel = NSTextField(labelWithString: "未选择注入资产")
-    private let statusDots = NSTextField(labelWithString: "")
+
+
     private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
     private let selectButton = NSButton(title: "设为壁纸", target: nil, action: nil)
     private let injectButton = NSButton(title: "注入新壁纸", target: nil, action: nil)
+    private let deleteButton = NSButton(title: "删除选中", target: nil, action: nil)
     private let restoreButton = NSButton(title: "恢复基线", target: nil, action: nil)
 
     override func loadView() {
@@ -40,46 +45,43 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
         configure(selectButton, #selector(doSelect), "desktopcomputer")
         configure(injectButton, #selector(doInject), "plus")
         configure(restoreButton, #selector(doRestore), "arrow.counterclockwise")
+        configure(deleteButton, #selector(doDelete), "trash")
         configure(refreshButton, #selector(doRefresh), "arrow.clockwise")
         toolbar.addArrangedSubview(selectButton)
         toolbar.addArrangedSubview(injectButton)
+        toolbar.addArrangedSubview(deleteButton)
         toolbar.addArrangedSubview(restoreButton)
         toolbar.addArrangedSubview(NSView())
         toolbar.addArrangedSubview(refreshButton)
         toolbar.translatesAutoresizingMaskIntoConstraints = false
 
-        // 左:标题 + 列表
-        let listTitle = NSTextField(labelWithString: "注入资产")
-        listTitle.font = .boldSystemFont(ofSize: 14)
+        // 左:缩略图网格(壁纸面板式排列:分类分组,左对齐,卡片完整缩略图)
         let listScroll = NSScrollView()
-        let column = NSTableColumn(identifier: .init("name"))
-        column.title = "资产"
-        column.width = 260
-        tableView.addTableColumn(column)
-        tableView.headerView = nil
-        tableView.dataSource = self
-        tableView.delegate = self
-        tableView.rowHeight = 30
-        tableView.allowsEmptySelection = true
-        listScroll.documentView = tableView
+        let layout = NSCollectionViewFlowLayout()
+        layout.itemSize = NSSize(width: 168, height: 168)
+        layout.sectionInset = NSEdgeInsets(top: 4, left: 8, bottom: 7, right: 8)
+        layout.minimumInteritemSpacing = 10
+        layout.minimumLineSpacing = 8
+        layout.headerReferenceSize = NSSize(width: 0, height: 14)
+        collectionView.collectionViewLayout = layout
+        collectionView.dataSource = self
+        collectionView.delegate = self
+        collectionView.isSelectable = true
+        collectionView.backgroundColors = [.clear]
+        collectionView.register(AssetCardItem.self, forItemWithIdentifier: .init("AssetCard"))
+        collectionView.register(AssetHeaderView.self,
+                                forSupplementaryViewOfKind: NSCollectionView.elementKindSectionHeader,
+                                withIdentifier: .init("Header"))
+        listScroll.documentView = collectionView
         listScroll.hasVerticalScroller = true
 
-        let leftStack = NSStackView(views: [listTitle, listScroll])
+        let leftStack = NSStackView(views: [listScroll])
         leftStack.orientation = .vertical
         leftStack.spacing = 6
         leftStack.translatesAutoresizingMaskIntoConstraints = false
         listScroll.translatesAutoresizingMaskIntoConstraints = false
 
-        // 状态条
-        let statusIcon = NSTextField(labelWithString: "⏸")
-        statusIcon.font = .systemFont(ofSize: 14)
-        statusDots.font = .systemFont(ofSize: 10)
-        statusDots.textColor = .secondaryLabelColor
-        let statusStack = NSStackView(views: [statusIcon, statusLabel, NSView(), statusDots])
-        statusStack.orientation = .horizontal
-        statusStack.spacing = 8
-
-        let leftContainer = NSStackView(views: [leftStack, statusStack])
+        let leftContainer = NSStackView(views: [leftStack])
         leftContainer.orientation = .vertical
         leftContainer.spacing = 8
         leftContainer.translatesAutoresizingMaskIntoConstraints = false
@@ -147,11 +149,22 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
             let (list, st) = await (svc.list(), svc.status())
             self.assets = list
             self.status = st
-            self.tableView.reloadData()
-            self.updateStatusBar()
-            self.appendLog("已加载 \(list.count) 个注入资产")
+            self.rebuildGroups()
+                self.collectionView.reloadData()
+                        self.appendLog("已加载 \(list.count) 个注入资产")
             if !st.assetID.isEmpty {
                 self.appendLog("当前: \(st.name)(\(st.assetID.prefix(8))) \(st.playing ? "PLAYING" : "")")
+            }
+            // 启动自查:注入资产完整性 + choice 一致性
+            let (_, choice) = AerialManifest.list()
+            let choiceID = choice["assetID"] ?? ""
+            for a in list where !a.downloaded {
+                self.appendLog("⚠ \(a.name): 视频未下载(在壁纸面板选择一次触发下载)")
+            }
+            if let a = list.first(where: { $0.id == choiceID }) {
+                self.appendLog("choice 指向注入资产 \(a.name)(\(a.downloaded ? "已下载" : "未下载"))")
+            } else if !choiceID.isEmpty {
+                self.appendLog("choice 指向非注入资产或已失效资产")
             }
             self.setBusy(false)
         }
@@ -159,22 +172,12 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
 
     private func setBusy(_ b: Bool) {
         busy = b
-        selectButton.isEnabled = !b && selectedID != nil
-        injectButton.isEnabled = !b
-        restoreButton.isEnabled = !b
-        refreshButton.isEnabled = !b
-    }
-
-    private func updateStatusBar() {
-        guard let s = status else {
-            statusLabel.stringValue = "未选择注入资产"
-            statusDots.stringValue = ""
-            return
-        }
-        statusLabel.stringValue = s.assetID.isEmpty ? "未选择注入资产"
-            : (s.name.isEmpty ? String(s.assetID.prefix(8)) : s.name)
-        statusDots.stringValue = s.playing ? "● 播放中" : "○ 未播放"
-        statusDots.textColor = s.playing ? .systemGreen : .secondaryLabelColor
+        // 转码在后台并行执行:全部按钮可用(可并发注入多个)
+        injectButton.isEnabled = true
+        deleteButton.isEnabled = selectedID != nil
+        selectButton.isEnabled = selectedID != nil
+        restoreButton.isEnabled = true
+        refreshButton.isEnabled = true
     }
 
     private func appendLog(_ s: String) {
@@ -208,8 +211,7 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
                 self.appendLog("select \(id.prefix(8)):\n\(out)")
                 try await Task.sleep(nanoseconds: 2_000_000_000)
                 self.status = await WallpaperService.shared.status()
-                self.updateStatusBar()
-            } catch {
+                            } catch {
 
                 self.appendLog("ERROR(select): \(error.localizedDescription)")
                 self.showError(error.localizedDescription)
@@ -228,19 +230,88 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
 
     private func runPrepare(video: URL, name: String, thumb: URL?, newCat: String?) {
         setBusy(true)
+        transcodingProgress[name] = 0
+        // 立即快速抽帧(原视频)→ 列表先显示缩略图 + 转码中状态
         Task {
+            var thumbPath = ""
+            if let t = thumb {
+                thumbPath = t.path
+            } else if let p = try? ThumbnailExtractor.extractFrame(from: video).path {
+                thumbPath = p
+            }
+            let pending = InjectedAsset(id: "pending", name: name,
+                                        categories: [newCat ?? "注入中"], subcategories: [],
+                                        url: "", downloaded: false, thumb: thumbPath)
+            await MainActor.run {
+                self.assets = [pending] + self.assets
+                self.rebuildGroups()
+                self.collectionView.reloadData()
+            }
+        }
+        Task {
+            let stream = await WallpaperService.shared.prepareStream(
+                videoURL: video, name: name, thumbnailURL: thumb, newCategory: newCat)
+            var finalLog = ""
+            for await ev in stream {
+                switch ev {
+                case .stage(let s):
+                    _ = s  // 阶段提示由卡片进度条承载
+                case .progress(let p):
+                    self.transcodingProgress[name] = p
+                    if let item = self.transcodingItem {
+                        item.pctLabel.stringValue = "\(Int(p * 100))%"
+                    }
+                case .log(let s):
+                    self.appendLog(s)
+                case .done(let s):
+                    finalLog = s
+                case .error(let e):
+                    self.appendLog("ERROR(prepare): \(e)")
+                    self.showError(e)
+                }
+            }
+            self.transcodingProgress.removeValue(forKey: name)
+            self.transcodingItem = nil
+            self.appendLog("prepare \(name):\n\(finalLog)")
+            self.appendLog("refresh: 重查面板模型...")
             do {
-                let out = try await WallpaperService.shared.prepare(
-                    videoURL: video, name: name, thumbnailURL: thumb, newCategory: newCat)
-                self.appendLog("prepare \(name):\n\(out)")
-                self.appendLog("refresh: 重查面板模型...")
                 let r = try await WallpaperService.shared.refresh()
                 self.appendLog(r)
                 self.assets = await WallpaperService.shared.list()
-                self.tableView.reloadData()
+                self.rebuildGroups()
+                self.collectionView.reloadData()
             } catch {
+                self.appendLog("ERROR(refresh): \(error.localizedDescription)")
+                self.showError(error.localizedDescription)
+            }
+            self.setBusy(false)
+        }
+    }
 
-                self.appendLog("ERROR(prepare): \(error.localizedDescription)")
+    @objc private func doDelete() {
+        guard let id = selectedID else { return }
+        guard let asset = assets.first(where: { $0.id == id }) else { return }
+        let alert = NSAlert()
+        alert.messageText = "删除资产?"
+        alert.informativeText = "将从 entries 移除 \(asset.name),并删除其视频/缩略图。若它是当前壁纸,choice 恢复 用户壁纸。"
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        setBusy(true)
+        Task {
+            do {
+                let out = try await WallpaperService.shared.delete(id: id)
+                self.appendLog("delete:\(out)")
+                self.appendLog("refresh: 同步面板模型...")
+                let r = try await WallpaperService.shared.refresh()
+                self.appendLog(r)
+                let svc = WallpaperService.shared
+                self.assets = await svc.list()
+                self.status = await svc.status()
+                self.rebuildGroups()
+                self.collectionView.reloadData()
+                            } catch {
+                self.appendLog("ERROR(delete): \(error.localizedDescription)")
                 self.showError(error.localizedDescription)
             }
             self.setBusy(false)
@@ -262,9 +333,9 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
                 let svc = WallpaperService.shared
                 self.assets = await svc.list()
                 self.status = await svc.status()
-                self.tableView.reloadData()
-                self.updateStatusBar()
-            } catch {
+                self.rebuildGroups()
+                self.collectionView.reloadData()
+                            } catch {
 
                 self.appendLog("ERROR(restore): \(error.localizedDescription)")
                 self.showError(error.localizedDescription)
@@ -281,42 +352,196 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
         alert.runModal()
     }
 
-    // MARK: NSTableViewDataSource / Delegate
+    // MARK: 分组 + 选择
 
-    func numberOfRows(in tableView: NSTableView) -> Int { assets.count }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let asset = assets[row]
-        let cell = NSTableCellView()
-        let icon = NSTextField(labelWithString: asset.downloaded ? "⬇" : "○")
-        icon.font = .systemFont(ofSize: 12)
-        let name = NSTextField(labelWithString: asset.name)
-        name.lineBreakMode = .byTruncatingTail
-        let cat = NSTextField(labelWithString: asset.categories.joined(separator: ", "))
-        cat.font = .systemFont(ofSize: 10)
-        cat.textColor = .secondaryLabelColor
-        let stack = NSStackView(views: [icon, name])
-        stack.orientation = .horizontal
-        stack.spacing = 6
-        let outer = NSStackView(views: [stack, cat])
-        outer.orientation = .vertical
-        outer.spacing = 0
-        outer.alignment = .leading
-        cell.addSubview(outer)
-        outer.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            outer.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-            outer.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
-            outer.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-        ])
-        return cell
+    private func rebuildGroups() {
+        var map: [String: [InjectedAsset]] = [:]
+        for a in assets {
+            let key = a.categories.first ?? "未分类"
+            map[key, default: []].append(a)
+        }
+        groups = map.map { (name: $0.key, items: $0.value) }
+            .sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
     }
 
-    func tableViewSelectionDidChange(_ notification: Notification) {
-        let row = tableView.selectedRow
-        selectedID = row >= 0 && row < assets.count ? assets[row].id : nil
+    // MARK: NSCollectionViewDataSource / Delegate
+
+    func numberOfSections(in collectionView: NSCollectionView) -> Int { groups.count }
+
+    func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int {
+        groups[section].items.count
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
+        let item = collectionView.makeItem(withIdentifier: .init("AssetCard"), for: indexPath) as! AssetCardItem
+        let asset = groups[indexPath.section].items[indexPath.item]
+        let prog = transcodingProgress[asset.name]
+        item.configure(asset: asset, progress: prog)
+        if prog != nil {
+            transcodingItem = item
+        }
+        return item
+    }
+
+    func collectionView(_ collectionView: NSCollectionView,
+                        viewForSupplementaryElementOfKind kind: String,
+                        at indexPath: IndexPath) -> NSView {
+        let header = collectionView.makeSupplementaryView(
+            ofKind: kind, withIdentifier: .init("Header"), for: indexPath) as! AssetHeaderView
+        header.titleLabel.stringValue = groups[indexPath.section].name
+        return header
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
+        guard let ip = indexPaths.first, ip.section < groups.count, ip.item < groups[ip.section].items.count else {
+            selectedID = nil
+            return
+        }
+        selectedID = groups[ip.section].items[ip.item].id
         selectButton.isEnabled = !busy && selectedID != nil
     }
+
+    func collectionView(_ collectionView: NSCollectionView, didDeselectItemsAt indexPaths: Set<IndexPath>) {
+        selectedID = nil
+        selectButton.isEnabled = false
+    }
+}
+
+// MARK: - 资产卡片(壁纸面板式缩略图)
+
+final class AssetCardItem: NSCollectionViewItem {
+    let imgView = NSImageView()
+    let nameLabel = NSTextField(labelWithString: "")
+    let pctLabel = NSTextField(labelWithString: "")  // 缩略图右下:百分比
+    private let ringContainer = NSView()             // 缩略图右上:环形进度(仿 wallpaper 下载蓝圈)
+    private let ringLayer = CAShapeLayer()           // 背景环
+    let progressRing = CAShapeLayer()                // 蓝色进度环(外部更新 strokeEnd)
+
+    override func loadView() {
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 168, height: 118))
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        // 裁切填充(aspect fill),无黑边
+        imgView.imageScaling = .scaleAxesIndependently
+        imgView.wantsLayer = true
+        imgView.layer?.contentsGravity = .resizeAspectFill
+        imgView.layer?.cornerRadius = 6
+        imgView.layer?.masksToBounds = true
+        nameLabel.lineBreakMode = .byTruncatingTail
+        nameLabel.font = .systemFont(ofSize: 12)
+
+        // 环形进度:白色半透明背景环 + 系统蓝进度环(仿 wallpaper 下载)
+        let circle = NSBezierPath(ovalIn: CGRect(x: 1.5, y: 1.5, width: 13, height: 13)).cgPath
+        ringLayer.path = circle
+        ringLayer.strokeColor = NSColor.white.withAlphaComponent(0.45).cgColor
+        ringLayer.fillColor = nil
+        ringLayer.lineWidth = 2.5
+        progressRing.path = circle
+        progressRing.strokeColor = NSColor.systemBlue.cgColor
+        progressRing.fillColor = nil
+        progressRing.lineWidth = 2.5
+        progressRing.lineCap = .round
+        progressRing.strokeEnd = 0
+        progressRing.transform = CATransform3DMakeRotation(-.pi / 2, 0, 0, 1)  // 从 12 点方向开始
+        ringContainer.wantsLayer = true
+        ringContainer.layer?.addSublayer(ringLayer)
+        ringContainer.layer?.addSublayer(progressRing)
+        ringContainer.isHidden = true
+
+        pctLabel.font = .systemFont(ofSize: 9, weight: .bold)
+        pctLabel.textColor = .white
+        pctLabel.alignment = .right
+        pctLabel.wantsLayer = true
+        pctLabel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.65).cgColor
+        pctLabel.layer?.cornerRadius = 3
+        pctLabel.isHidden = true
+
+        // 缩略图容器(叠加环/百分比)
+        let imgContainer = NSView()
+        imgContainer.wantsLayer = true
+        imgContainer.layer?.cornerRadius = 6
+        imgContainer.layer?.masksToBounds = true
+        imgContainer.addSubview(imgView)
+        imgContainer.addSubview(ringContainer)
+        imgContainer.addSubview(pctLabel)
+        imgView.translatesAutoresizingMaskIntoConstraints = false
+        ringContainer.translatesAutoresizingMaskIntoConstraints = false
+        pctLabel.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            imgView.leadingAnchor.constraint(equalTo: imgContainer.leadingAnchor),
+            imgView.trailingAnchor.constraint(equalTo: imgContainer.trailingAnchor),
+            imgView.topAnchor.constraint(equalTo: imgContainer.topAnchor),
+            imgView.bottomAnchor.constraint(equalTo: imgContainer.bottomAnchor),
+            // 右上角环形进度
+            ringContainer.trailingAnchor.constraint(equalTo: imgContainer.trailingAnchor, constant: -6),
+            ringContainer.topAnchor.constraint(equalTo: imgContainer.topAnchor, constant: 6),
+            ringContainer.widthAnchor.constraint(equalToConstant: 16),
+            ringContainer.heightAnchor.constraint(equalToConstant: 16),
+            // 右下角百分比
+            pctLabel.trailingAnchor.constraint(equalTo: imgContainer.trailingAnchor, constant: -5),
+            pctLabel.bottomAnchor.constraint(equalTo: imgContainer.bottomAnchor, constant: -5),
+            pctLabel.widthAnchor.constraint(equalToConstant: 30),
+        ])
+
+        let stack = NSStackView(views: [imgContainer, nameLabel])
+        stack.orientation = .vertical
+        stack.spacing = 3
+        stack.alignment = .leading
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: view.topAnchor),
+            imgContainer.widthAnchor.constraint(equalToConstant: 168),
+            imgContainer.heightAnchor.constraint(equalToConstant: 94),  // 16:9 完整显示
+            nameLabel.widthAnchor.constraint(equalToConstant: 168),
+        ])
+    }
+
+    func configure(asset: InjectedAsset, progress: Double?) {
+        nameLabel.stringValue = asset.name
+        if let p = progress {
+            progressRing.strokeEnd = p
+            ringContainer.isHidden = false
+            pctLabel.stringValue = "\(Int(p * 100))%"
+            pctLabel.isHidden = false
+        } else {
+            progressRing.strokeEnd = 0
+            ringContainer.isHidden = true
+            pctLabel.isHidden = true
+        }
+        if !asset.thumb.isEmpty {
+            Task {
+                let img = NSImage(contentsOfFile: asset.thumb)
+                await MainActor.run { self.imgView.image = img }
+            }
+        } else {
+            imgView.image = NSImage(systemSymbolName: asset.downloaded ? "arrow.down.circle.fill" : "photo",
+                                    accessibilityDescription: nil)
+        }
+    }
+}
+
+// MARK: - 分类标题
+
+final class AssetHeaderView: NSView {
+    let titleLabel = NSTextField(labelWithString: "")
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        titleLabel.font = .boldSystemFont(ofSize: 13)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(titleLabel)
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
 }
 
 // MARK: - 注入面板(AppKit sheet)
@@ -325,9 +550,7 @@ final class MainViewController: NSViewController, NSTableViewDataSource, NSTable
 final class InjectSheetController: NSViewController {
     private let onSubmit: (URL?, String, URL?, String?) -> Void
     private var videoURL: URL?
-    private var thumbURL: URL?
     private let videoField = NSTextField(labelWithString: "(未选择)")
-    private let thumbField = NSTextField(labelWithString: "(可选,缺省自动抽帧)")
     private let nameField = NSTextField()
     private let catField = NSTextField()
 
@@ -348,9 +571,9 @@ final class InjectSheetController: NSViewController {
 
         let videoRow = row("视频:", videoField, button: "选择…", action: #selector(pickVideo))
         let nameRow = row("名称:", nameField, button: nil, action: nil)
-        let thumbRow = row("缩略图:", thumbField, button: "选择…", action: #selector(pickThumb))
         let catRow = row("新分类:", catField, button: nil, action: nil)
-        catField.placeholderString = "留空归入 Landscape;填则新建独立分类"
+        catField.stringValue = "MWI"
+        catField.placeholderString = "新分类名(默认 MWI 独立分类)"
 
         let cancel = NSButton(title: "取消", target: self, action: #selector(cancelTapped))
         cancel.keyEquivalent = "\u{1b}"
@@ -361,7 +584,7 @@ final class InjectSheetController: NSViewController {
         buttons.orientation = .horizontal
         buttons.spacing = 8
 
-        let stack = NSStackView(views: [videoRow, nameRow, thumbRow, catRow, buttons])
+        let stack = NSStackView(views: [videoRow, nameRow, catRow, buttons])
         stack.orientation = .vertical
         stack.spacing = 14
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -403,16 +626,6 @@ final class InjectSheetController: NSViewController {
         }
     }
 
-    @objc private func pickThumb() {
-        let p = NSOpenPanel()
-        p.allowedContentTypes = [.png, .jpeg]
-        p.allowsMultipleSelection = false
-        if p.runModal() == .OK, let url = p.url {
-            thumbURL = url
-            thumbField.stringValue = url.lastPathComponent
-        }
-    }
-
     @objc private func cancelTapped() {
         dismiss(self)
     }
@@ -421,7 +634,7 @@ final class InjectSheetController: NSViewController {
         let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
         guard videoURL != nil, !name.isEmpty else { return }
         let cat = catField.stringValue.trimmingCharacters(in: .whitespaces)
-        onSubmit(videoURL, name, thumbURL, cat.isEmpty ? nil : cat)
+        onSubmit(videoURL, name, nil, cat.isEmpty ? nil : cat)
         dismiss(self)
     }
 }

@@ -118,13 +118,21 @@ enum AerialManifest {
                 let catNames = (a["categories"] as? [String] ?? []).map { cats[$0] ?? String($0.prefix(8)) }
                 let id = (a["id"] as? String) ?? ""
                 let vf = Paths.videosDir.appendingPathComponent("\(id).mov")
+                // 缩略图:previewImage(http://127.0.0.1:8181/xxx.png)→ 本地 httpDir
+                var thumb = ""
+                let preview = (a["previewImage"] as? String) ?? ""
+                if let tn = preview.components(separatedBy: "/").last, !tn.isEmpty {
+                    let tp = Paths.httpDir.appendingPathComponent(tn).path
+                    if FileManager.default.fileExists(atPath: tp) { thumb = tp }
+                }
                 injected.append(InjectedAsset(
                     id: id,
                     name: (a["localizedNameKey"] as? String) ?? "",
                     categories: catNames,
                     subcategories: (a["subcategories"] as? [String] ?? []).map { String($0.prefix(8)) },
                     url: url.isEmpty ? url4k : url,
-                    downloaded: FileManager.default.fileExists(atPath: vf.path)
+                    downloaded: FileManager.default.fileExists(atPath: vf.path),
+                    thumb: thumb
                 ))
             }
         }

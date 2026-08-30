@@ -69,6 +69,7 @@ struct InjectedAsset: Identifiable, Codable, Equatable {
     let subcategories: [String]
     let url: String
     let downloaded: Bool
+    let thumb: String  // 本地缩略图路径(空 = 无)
 }
 
 struct StatusInfo: Codable, Equatable {

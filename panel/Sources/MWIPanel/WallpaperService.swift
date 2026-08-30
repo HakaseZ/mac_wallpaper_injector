@@ -83,6 +83,8 @@ final class HTTPServer {
 
 actor WallpaperService {
     static let shared = WallpaperService()
+    /// 全局转码门:并发注入时转码排队(总 CPU 限速 ≈ 单转码限速,不随并发数线性叠加)
+    private static let transcodeGate = DispatchSemaphore(value: 1)
     private var httpServer: HTTPServer?
 
     // MARK: list / status
@@ -96,8 +98,13 @@ actor WallpaperService {
     }
 
     func status() -> StatusInfo {
-        let st = JSONFile.loadDict(Paths.state)
-        let aid = (st["asset_id"] as? String) ?? ""
+        // 无 STATE:从系统 choice 读当前资产
+        let (_, choice) = AerialManifest.list()
+        let aid = choice["assetID"] ?? ""
+        var name = ""
+        if !aid.isEmpty {
+            name = AerialManifest.assetName(id: aid) ?? ""
+        }
         let logOut = runLogShow(lastSeconds: 90)
         let downloaded = !aid.isEmpty && FileManager.default.fileExists(
             atPath: Paths.videosDir.appendingPathComponent("\(aid).mov").path)
@@ -105,7 +112,7 @@ actor WallpaperService {
         let looping = logOut.components(separatedBy: "startReading callback: success").count - 1 >= 2
         let snapshot = logOut.contains("Snapshot succeeded")
         return StatusInfo(assetID: aid,
-                          name: (st["name"] as? String) ?? "",
+                          name: name,
                           downloaded: downloaded,
                           startReading: startReading,
                           looping: looping,
@@ -173,6 +180,11 @@ actor WallpaperService {
         guard let name = AerialManifest.assetName(id: id) else {
             throw ServiceError.msg("asset \(id.prefix(8)) not found in entries.json")
         }
+        // 确保壁纸面板打开(ax_select 需要 System Settings 进程)
+        if !systemSettingsRunning() {
+            openWallpaperPanel()
+            sleep(6)
+        }
         let clicked = AXSelection.clickAsset(named: name)
         guard clicked else {
             throw ServiceError.msg("asset '\(name)' not found in panel (check entries.json + refresh)")
@@ -180,16 +192,147 @@ actor WallpaperService {
         return "selecting '\(name)' in wallpaper panel... CLICKED\n"
     }
 
+    private func systemSettingsRunning() -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        proc.arguments = ["-c", "pgrep -x 'System Settings'"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        try? proc.run()
+        proc.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !out.isEmpty
+    }
+
     // MARK: prepare
 
+    // MARK: delete(删除注入资产)
+
+    @discardableResult
+    func delete(id: String) throws -> String {
+        var log = ""
+        let fm = FileManager.default
+        // entries 移除资产
+        var d = JSONFile.loadDict(Paths.entries)
+        var assets = d["assets"] as? [[String: Any]] ?? []
+        guard let idx = assets.firstIndex(where: { ($0["id"] as? String) == id }) else {
+            throw ServiceError.msg("asset \(id.prefix(8)) not found in entries.json")
+        }
+        let asset = assets.remove(at: idx)
+        let name = (asset["localizedNameKey"] as? String) ?? id.prefix(8).description
+        d["assets"] = assets
+        // 空分类清理(新分类无其他资产 → 移除)
+        let catIDs = (asset["categories"] as? [String]) ?? []
+        var cats = d["categories"] as? [[String: Any]] ?? []
+        for cid in catIDs {
+            let stillUsed = assets.contains { ((($0["categories"] as? [String]) ?? []).contains(cid)) }
+            if !stillUsed {
+                cats.removeAll { ($0["id"] as? String) == cid }
+                log += "移除空分类 \(cid.prefix(8))\n"
+            }
+        }
+        d["categories"] = cats
+        try JSONFile.saveDict(d, to: Paths.entries)
+        log += "entries.json: asset \(name) removed\n"
+        // 删视频/缩略图
+        for dir in [Paths.videosDir, Paths.thumbnailsDir] {
+            for ext in ["mov", "png"] {
+                let f = dir.appendingPathComponent("\(id).\(ext)")
+                if fm.fileExists(atPath: f.path) {
+                    try? fm.removeItem(at: f)
+                    log += "removed \(f.lastPathComponent)\n"
+                }
+            }
+        }
+        // choice 指向它 → 恢复基线(用户壁纸)
+        let (_, choice) = AerialManifest.list()
+        if choice["assetID"] == id {
+            let idxBase = Paths.exp009Baseline.appendingPathComponent("Index.plist.baseline")
+            if fm.fileExists(atPath: idxBase.path) {
+                try? fm.removeItem(at: Paths.index)
+                try fm.copyItem(at: idxBase, to: Paths.index)
+                log += "choice 恢复 用户壁纸\n"
+            }
+        }
+        killAgent()
+        return log + "deleted \(name)\(id.prefix(8))\n"
+    }
+
+    // MARK: prepare(异步,带进度)
+
+    struct PreparedFiles {
+        let assetID: String
+        let video: URL
+        let thumb: URL
+    }
+
+    enum PrepareEvent {
+        case stage(String)     // 阶段文本(转码/补丁/注入)
+        case progress(Double)  // 0-1
+        case log(String)
+        case done(String)      // 完成(含日志)
+        case error(String)
+    }
+
+    /// 后台完整注入流程。
+    /// 转码/补丁/预置在 detached 并行执行(各自限速,互不阻塞);entries 写入走 actor 串行(避免并发覆盖丢资产)
+    func prepareStream(videoURL: URL, name: String, thumbnailURL: URL?, newCategory: String?) -> AsyncStream<PrepareEvent> {
+        AsyncStream { continuation in
+            Task {
+                do {
+                    let files = try await Task.detached(priority: .utility) {
+                        try WallpaperService.prepareFiles(
+                            videoURL: videoURL, thumbnailURL: thumbnailURL,
+                            stage: { continuation.yield(.stage($0)) },
+                            progress: { continuation.yield(.progress($0)) })
+                    }.value
+                    // 注入(actor 串行:并发 prepareStream 依次写 entries,不互相覆盖)
+                    let log = try await self.injectPrepared(files: files, name: name, newCategory: newCategory)
+                    continuation.yield(.done(log))
+                } catch {
+                    continuation.yield(.error(error.localizedDescription))
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    /// entries 注入(actor 隔离 → 串行执行)
+    private func injectPrepared(files: PreparedFiles, name: String, newCategory: String?) throws -> String {
+        try AerialManifest.inject(assetID: files.assetID, name: name, newCategory: newCategory)
+    }
+
+    /// 同步版本(测试/内部用)
     @discardableResult
     func prepare(videoURL: URL, name: String, thumbnailURL: URL?, newCategory: String?) throws -> String {
-        let port = Paths.defaultPort
+        let files = try WallpaperService.prepareFiles(
+            videoURL: videoURL, thumbnailURL: thumbnailURL, stage: { _ in }, progress: { _ in })
+        return try injectPrepared(files: files, name: name, newCategory: newCategory)
+    }
+
+    /// 非隔离核心:转码(限速+进度)→ 补丁 → 预置 videos/thumbnails(不写 entries,并发安全)
+    private static func prepareFiles(videoURL: URL, thumbnailURL: URL?,
+                                     stage: @escaping @Sendable (String) -> Void,
+                                     progress: @escaping @Sendable (Double) -> Void) throws -> PreparedFiles {
         let assetID = UUID().uuidString.uppercased()
         let fm = FileManager.default
 
-        // 1. 打补丁(未打则输出 _patched.mov)
+        // 0. 编码检测:非 HEVC(hvc1/hev1)→ ffmpeg 转码(总限速:全局门排队,总 CPU 不叠加)
         var video = videoURL
+        if let codec = MOVPatcher.codecOf(video), codec != "hvc1", codec != "hev1" {
+            stage("转码 HEVC 中(后台限速,避免发热)...")
+            let tmp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString + "_mwi.mov")
+            transcodeGate.wait()  // 排队:同时最多一个转码 → 总 CPU 限速
+            defer { transcodeGate.signal() }
+            try runFFmpegTranscode(input: video, output: tmp, progress: progress)
+            video = tmp
+        } else {
+            stage("视频已是 HEVC,跳过转码")
+        }
+
+        // 1. 打补丁(未打则输出 _patched.mov)
+        stage("打补丁(mov atom)...")
         if !video.lastPathComponent.contains("_patched") {
             let patched = video.deletingLastPathComponent()
                 .appendingPathComponent(video.deletingPathExtension().lastPathComponent + "_patched.mov")
@@ -197,35 +340,92 @@ actor WallpaperService {
             video = patched
         }
 
-        // 2. 复制视频到 http 目录 + 缩略图(用户提供则复制;缺省 AVFoundation 抽帧直接写 httpDir)
-        try fm.createDirectory(at: Paths.httpDir, withIntermediateDirectories: true)
-        let videoName = video.lastPathComponent
-        try? fm.removeItem(at: Paths.httpDir.appendingPathComponent(videoName))
-        try fm.copyItem(at: video, to: Paths.httpDir.appendingPathComponent(videoName))
+        // 2. 预置视频 + 缩略图到 aerials 目录(file:// 下载源;不经网络/代理)
+        try fm.createDirectory(at: Paths.videosDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: Paths.thumbnailsDir, withIntermediateDirectories: true)
+        let destVideo = Paths.videosDir.appendingPathComponent("\(assetID).mov")
+        try? fm.removeItem(at: destVideo)
+        try fm.copyItem(at: video, to: destVideo)
 
-        var thumbName: String
+        var thumbURL: URL
         if let thumb = thumbnailURL {
-            thumbName = thumb.lastPathComponent
-            try? fm.removeItem(at: Paths.httpDir.appendingPathComponent(thumbName))
-            try fm.copyItem(at: thumb, to: Paths.httpDir.appendingPathComponent(thumbName))
+            thumbURL = thumb
         } else {
             let cand = video.deletingPathExtension().appendingPathExtension("png")
             if fm.fileExists(atPath: cand.path) {
-                thumbName = cand.lastPathComponent
-                try? fm.removeItem(at: Paths.httpDir.appendingPathComponent(thumbName))
-                try fm.copyItem(at: cand, to: Paths.httpDir.appendingPathComponent(thumbName))
+                thumbURL = cand
             } else {
-                thumbName = try ThumbnailExtractor.extractFrame(from: video).lastPathComponent
+                thumbURL = try ThumbnailExtractor.extractFrame(from: video)
             }
         }
+        let destThumb = Paths.thumbnailsDir.appendingPathComponent("\(assetID).png")
+        try? fm.removeItem(at: destThumb)
+        try fm.copyItem(at: thumbURL, to: destThumb)
+        return PreparedFiles(assetID: assetID, video: video, thumb: destThumb)
+    }
 
-        // 4. entries 注入
-        let log = try AerialManifest.inject(videoName: videoName, thumbName: thumbName, port: port,
-                                            name: name, assetID: assetID, newCategory: newCategory)
+    /// 调 ffmpeg 转码为 aerials 合规 HEVC 10bit(非隔离,detached 可调用)。
+    /// 性能限制:线程数 = max(2, 核数/2) + nice 10(不抢系统资源、避免急剧发热)
+    /// 进度:ffmpeg -progress pipe:1 输出 out_time_us,经 progress 回调(0-1)
+    private static func runFFmpegTranscode(input: URL, output: URL,
+                                           progress: @escaping @Sendable (Double) -> Void) throws {
+        let candidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+        guard let ffmpeg = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw ServiceError.msg("ffmpeg 未安装(需转码 HEVC);brew install ffmpeg")
+        }
+        // 视频总时长(进度分母)
+        let duration = AVURLAsset(url: input).duration.seconds
+        // 线程限制:单线程 + nice 20 → CPU ~10%,风扇安静
+        let threads = 1
+        let args = ["-y", "-i", input.path,
+                    "-c:v", "libx265", "-preset", "medium", "-crf", "18",
+                    "-x265-params",
+                    "keyint=60:min-keyint=60:scenecut=0:bframes=4:b-adapt=2:b-pyramid=1:temporal-layers=3",
+                    "-pix_fmt", "yuv420p10le", "-profile:v", "main10", "-tag:v", "hvc1",
+                    "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+                    "-color_range", "tv", "-video_track_timescale", "240000", "-an",
+                    "-threads", "\(threads)",
+                    "-progress", "pipe:1",
+                    output.path]
+        // nice 20 降低优先级,不抢前台
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/nice")
+        proc.arguments = ["-n", "20", ffmpeg] + args
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+        try proc.run()
 
-        // 5. http 服务
-        try startHTTPServer(port: UInt16(port))
-        return log + "http server on :\(port)\n"
+        // 异步读进度输出(out_time_us)
+        let fh = outPipe.fileHandleForReading
+        var acc = Data()
+        let d = duration > 0 ? duration : 1
+        fh.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            acc.append(chunk)
+            // 逐行解析
+            var lines = String(decoding: acc, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false)
+            if lines.count > 1 {
+                acc = Data((lines.removeLast() ?? "").utf8)
+            }
+            for line in lines {
+                let kv = line.split(separator: "=", maxSplits: 1)
+                if kv.count == 2, kv[0] == "out_time_us", let us = Double(kv[1]), d > 0 {
+                    progress(min(max(us / (d * 1_000_000), 0), 1))
+                }
+            }
+        }
+        proc.waitUntilExit()
+        fh.readabilityHandler = nil
+        guard proc.terminationStatus == 0 else {
+            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw ServiceError.msg("ffmpeg 转码失败(exit \(proc.terminationStatus)): \(err.split(separator: "\n").suffix(3).joined(separator: "\n"))")
+        }
     }
 
     private func startHTTPServer(port: UInt16) throws {
@@ -233,6 +433,11 @@ actor WallpaperService {
         let s = HTTPServer(port: port, directory: Paths.httpDir)
         try s.start()
         httpServer = s
+    }
+
+    private func ensureHTTPServer() throws {
+        if let s = httpServer, s.isRunning { return }
+        try startHTTPServer(port: UInt16(Paths.defaultPort))
     }
 
     // MARK: restore
@@ -261,12 +466,12 @@ actor WallpaperService {
             try replace(idxBase, Paths.index)
             log += "Index.plist restored (用户壁纸)\n"
         }
-        // 注入资产视频 + 缩略图
-        let st = JSONFile.loadDict(Paths.state)
-        if let aid = st["asset_id"] as? String, !aid.isEmpty {
+        // 注入资产视频 + 缩略图(从 entries 收集,无 STATE 依赖)
+        let (injected, _) = AerialManifest.list()
+        for a in injected {
             for dir in [Paths.videosDir, Paths.thumbnailsDir] {
-                let f = dir.appendingPathComponent("\(aid).mov")
-                let p = dir.appendingPathComponent("\(aid).png")
+                let f = dir.appendingPathComponent("\(a.id).mov")
+                let p = dir.appendingPathComponent("\(a.id).png")
                 if fm.fileExists(atPath: f.path) { try? fm.removeItem(at: f); log += "removed \(f.lastPathComponent)\n" }
                 if fm.fileExists(atPath: p.path) { try? fm.removeItem(at: p); log += "removed \(p.lastPathComponent)\n" }
             }
@@ -277,7 +482,6 @@ actor WallpaperService {
         log += "http server stopped\n"
         killAgent()
         sleep(5)
-        try? fm.removeItem(at: Paths.state)
         log += "baseline restored\n"
         return log
     }
