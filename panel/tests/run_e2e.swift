@@ -38,10 +38,19 @@ struct RunE2E {
         let thumb = root.appendingPathComponent("test_videos/mwi_test4.png")
         print("== MWI 系统级 e2e(会修改系统壁纸状态,结束后自动回基线)==")
         do {
-            // 0. 基线
+            // 0. 基线 — 干净基线保护:e2e 的 restore/delete 会删除所有注入资产,
+            //    若系统已有真实注入资产(用户壁纸),立即中止,避免误删。
             print("[0] 基线")
-            _ = try await svc.restore()
             var (list, _) = AerialManifest.list()
+            if !list.isEmpty {
+                let names = list.map { $0.name }.joined(separator: ", ")
+                print("⚠  检测到 \(list.count) 个已有注入资产(\(names))")
+                print("⚠  e2e 的 restore/delete 会删除所有注入资产;请先手动删除这些资产(或备份)后重跑")
+                print("⚠  中止,未做任何修改")
+                exit(2)
+            }
+            _ = try await svc.restore()
+            (list, _) = AerialManifest.list()
             check("基线无注入资产", list.isEmpty, "count=\(list.count)")
 
             // 1. 注入 A(HEVC 小视频,跳过转码)
