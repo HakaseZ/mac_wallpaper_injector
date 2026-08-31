@@ -101,7 +101,7 @@ enum AerialManifest {
 
         // 备份用户 entries(仅首次)
         if FileManager.default.fileExists(atPath: Paths.entries.path) {
-            let backupDir = Paths.exp009Baseline.deletingLastPathComponent().appendingPathComponent("inject")
+            let backupDir = Paths.backupDir
             let backup = backupDir.appendingPathComponent("entries.json")
             log += "backupDir: \(backupDir.path)\n"
             do {
@@ -128,6 +128,31 @@ enum AerialManifest {
         log += "entries.json: \(assets.count) assets (injected \(name) = \(assetID.prefix(12)))\n"
 
         return log
+    }
+
+    /// 从 entries 移除资产并清理空分类;返回被移除资产与显示名(供调用方删除视频/缩略图)。
+    @discardableResult
+    static func remove(id: String) throws -> (asset: [String: Any], name: String) {
+        var d = loadEntries()
+        var assets = d["assets"] as? [[String: Any]] ?? []
+        guard let idx = assets.firstIndex(where: { ($0["id"] as? String) == id }) else {
+            throw ServiceError.msg("asset \(id.prefix(8)) not found in entries.json")
+        }
+        let asset = assets.remove(at: idx)
+        let name = (asset["localizedNameKey"] as? String) ?? id.prefix(8).description
+        d["assets"] = assets
+        // 空分类清理:被删资产引用的分类若无其他资产引用 → 移除
+        let catIDs = (asset["categories"] as? [String]) ?? []
+        var cats = d["categories"] as? [[String: Any]] ?? []
+        for cid in catIDs {
+            let stillUsed = assets.contains { ((($0["categories"] as? [String]) ?? []).contains(cid)) }
+            if !stillUsed {
+                cats.removeAll { ($0["id"] as? String) == cid }
+            }
+        }
+        d["categories"] = cats
+        try JSONFile.saveDict(d, to: Paths.entries)
+        return (asset, name)
     }
 
     // MARK: 重命名(资产/分类,右键菜单)

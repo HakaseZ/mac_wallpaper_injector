@@ -219,27 +219,8 @@ actor WallpaperService {
     func delete(id: String) throws -> String {
         var log = ""
         let fm = FileManager.default
-        // entries 移除资产
-        var d = JSONFile.loadDict(Paths.entries)
-        var assets = d["assets"] as? [[String: Any]] ?? []
-        guard let idx = assets.firstIndex(where: { ($0["id"] as? String) == id }) else {
-            throw ServiceError.msg("asset \(id.prefix(8)) not found in entries.json")
-        }
-        let asset = assets.remove(at: idx)
-        let name = (asset["localizedNameKey"] as? String) ?? id.prefix(8).description
-        d["assets"] = assets
-        // 空分类清理(新分类无其他资产 → 移除)
-        let catIDs = (asset["categories"] as? [String]) ?? []
-        var cats = d["categories"] as? [[String: Any]] ?? []
-        for cid in catIDs {
-            let stillUsed = assets.contains { ((($0["categories"] as? [String]) ?? []).contains(cid)) }
-            if !stillUsed {
-                cats.removeAll { ($0["id"] as? String) == cid }
-                log += "移除空分类 \(cid.prefix(8))\n"
-            }
-        }
-        d["categories"] = cats
-        try JSONFile.saveDict(d, to: Paths.entries)
+        // entries 移除资产 + 空分类清理
+        let (_, name) = try AerialManifest.remove(id: id)
         log += "entries.json: asset \(name) removed\n"
         // 删视频/缩略图
         for dir in [Paths.videosDir, Paths.thumbnailsDir] {
@@ -336,9 +317,9 @@ actor WallpaperService {
     }
 
     /// 非隔离核心:转码(限速+进度)→ 补丁 → 预置 videos/thumbnails(不写 entries,并发安全)
-    private static func prepareFiles(videoURL: URL, thumbnailURL: URL?,
-                                     stage: @escaping @Sendable (String) -> Void,
-                                     progress: @escaping @Sendable (Double) -> Void) throws -> PreparedFiles {
+    static func prepareFiles(videoURL: URL, thumbnailURL: URL?,
+                             stage: @escaping @Sendable (String) -> Void,
+                             progress: @escaping @Sendable (Double) -> Void) throws -> PreparedFiles {
         let assetID = UUID().uuidString.uppercased()
         let fm = FileManager.default
 
@@ -403,8 +384,8 @@ actor WallpaperService {
     /// BT.709 色标签走 setparams(filter 链;ffmpeg 9 输出级 -color_* 选项不可靠,文档实测)。
     /// 性能限制:单线程 + nice 20 → CPU ~10%,风扇安静
     /// 进度:ffmpeg -progress pipe:1 输出 out_time_us,经 progress 回调(0-1,分母取 ffprobe 时长)
-    private static func runFFmpegTranscode(input: URL, probe: VideoProbe, output: URL,
-                                           progress: @escaping @Sendable (Double) -> Void) throws {
+    static func runFFmpegTranscode(input: URL, probe: VideoProbe, output: URL,
+                                   progress: @escaping @Sendable (Double) -> Void) throws {
         guard let ffmpeg = Self.ffmpegPath() else {
             throw ServiceError.msg("ffmpeg 未安装(需转码 HEVC);brew install ffmpeg")
         }
@@ -475,7 +456,7 @@ actor WallpaperService {
     }
 
     /// ffmpeg 抽帧兜底(AVFoundation 打不开的输入)
-    private static func ffmpegFrameGrab(_ video: URL) throws -> URL {
+    static func ffmpegFrameGrab(_ video: URL) throws -> URL {
         guard let ffmpeg = Self.ffmpegPath() else {
             throw ServiceError.msg("缩略图生成失败(AVFoundation 不可读,且 ffmpeg 未安装)")
         }
@@ -497,7 +478,7 @@ actor WallpaperService {
 
     // MARK: ffprobe 探测(任意容器)
 
-    private struct VideoProbe {
+    struct VideoProbe {
         let hasVideo: Bool
         let fps: Int?          // 需归一化的整数帧率(29.97→30);CFR 已为整数则 nil
         let isHDR: Bool        // PQ(smpte2084)/HLG(arib-std-b67)
@@ -508,7 +489,7 @@ actor WallpaperService {
 
     /// ffprobe 探测视频轨:帧率(CFR/VFR)、色彩传输、分辨率奇偶、时长、容器级合规。任意容器均可读。
     /// ffmpeg/ffprobe 缺失时降级为不探测(保持旧行为),仅 ffmpeg 安装异常时抛错。
-    private static func probeVideo(input: URL) throws -> VideoProbe {
+    static func probeVideo(input: URL) throws -> VideoProbe {
         guard let ffmpeg = Self.ffmpegPath() else {
             return VideoProbe(hasVideo: true, fps: nil, isHDR: false, needsEvenScale: false, duration: 0, isCompliantHEVC: false)
         }
@@ -612,8 +593,8 @@ actor WallpaperService {
         var log = ""
         let fm = FileManager.default
         // entries 恢复(backup/inject 或 exp009 baseline)
-        let backup = Paths.exp009Baseline.deletingLastPathComponent().appendingPathComponent("inject/entries.json")
-        let baseline = Paths.exp009Baseline.appendingPathComponent("entries.json.baseline")
+        let backup = Paths.backupDir.appendingPathComponent("entries.json")
+        let baseline = Paths.backupDir.appendingPathComponent("entries.json.baseline")
         func replace(_ src: URL, _ dst: URL) throws {
             if fm.fileExists(atPath: dst.path) { try? fm.removeItem(at: dst) }
             try fm.copyItem(at: src, to: dst)
