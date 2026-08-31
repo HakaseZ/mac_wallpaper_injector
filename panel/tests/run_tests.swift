@@ -87,8 +87,18 @@ struct RunTests {
             check("选择后播放(startReading)", st.startReading, "sr=\(st.startReading)")
             let (_, choice) = AerialManifest.list()
             check("choice = AutoTest A", choice["assetID"] == target.id, "choice=\(choice["assetID"] ?? "nil") target=\(target.id)")
-            let vids = (try? FileManager.default.contentsOfDirectory(atPath: Paths.videosDir.path))?.filter { $0.hasSuffix(".mov") } ?? []
-            print("DEBUG videos count:", vids.count, "含target:", vids.contains { $0.hasPrefix(target.id) })
+            // 4.5 重命名(右键菜单底层:资产 + 分类)
+            print("[4.5] 重命名资产/分类")
+            _ = try await svc.renameAsset(id: target.id, newName: "AutoTest A-Renamed")
+            _ = try await svc.renameCategory(oldName: "MWI", newName: "MWI-Renamed")
+            (list, _) = AerialManifest.list()
+            check("重命名资产生效", list.contains { $0.name == "AutoTest A-Renamed" },
+                  "names=\(list.map { $0.name })")
+            check("重命名分类生效", list.first(where: { $0.name == "AutoTest A-Renamed" })?.categories.first == "MWI-Renamed",
+                  "cats=\(list.map { $0.categories.first ?? "" })")
+            let mwiCats2 = (JSONFile.loadDict(Paths.entries)["categories"] as? [[String: Any]] ?? [])
+                .filter { ($0["localizedNameKey"] as? String) == "MWI-Renamed" }
+            check("分类名落盘(不重复)", mwiCats2.count == 1, "count=\(mwiCats2.count)")
 
             // 5. 持久性:重启扩展 + agent → 播放自动恢复
             print("[5] 持久性(扩展重启后自动恢复)")

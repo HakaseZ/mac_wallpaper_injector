@@ -3,28 +3,67 @@ import UniformTypeIdentifiers
 
 // MARK: - 主界面(AppKit)
 
+/// 左对齐流式布局:AppKit 的 NSCollectionViewFlowLayout 会把不足一行的项目撑满整行
+/// (如 2 张卡被拉开到整行宽),系统壁纸面板是左对齐紧凑排列 —— 这里重排每行到左起点。
+final class LeftAlignedFlowLayout: NSCollectionViewFlowLayout {
+    override func layoutAttributesForElements(in rect: NSRect) -> [NSCollectionViewLayoutAttributes] {
+        guard let collectionView else { return super.layoutAttributesForElements(in: rect) }
+        let all = super.layoutAttributesForElements(in: rect)
+        // 找出 rect 涉及的行(同 section 同 y);对每行用该 section 全量 item 的原始位置重算左对齐,
+        // 避免 rect 裁剪只拿到半行时错位
+        var rowKeys: Set<String> = []
+        for a in all where a.representedElementCategory == .item {
+            rowKeys.insert(rowKey(a))
+        }
+        guard !rowKeys.isEmpty else { return all }
+
+        var corrected: [NSCollectionViewLayoutAttributes] = []
+        var seen = Set<String>()
+        for a in all {
+            if a.representedElementCategory == .item, let ip = a.indexPath {
+                let key = rowKey(a)
+                if rowKeys.contains(key), !seen.contains(key) {
+                    seen.insert(key)
+                    let sectionItems = (0..<collectionView.numberOfItems(inSection: ip.section))
+                        .compactMap { super.layoutAttributesForItem(at: IndexPath(item: $0, section: ip.section)) }
+                    let row = sectionItems.filter { abs($0.frame.minY - a.frame.minY) < 0.5 }
+                        .sorted { ($0.indexPath?.item ?? 0) < ($1.indexPath?.item ?? 0) }
+                    if let first = row.first {
+                        var x = first.frame.minX
+                        for at in row {
+                            at.frame.origin.x = x
+                            x += at.frame.width + minimumInteritemSpacing
+                        }
+                    }
+                    corrected.append(contentsOf: row)
+                }
+            } else {
+                corrected.append(a)
+            }
+        }
+        return corrected
+    }
+
+    private func rowKey(_ a: NSCollectionViewLayoutAttributes) -> String {
+        "\(a.indexPath?.section ?? -1)|\(Int(a.frame.minY * 2))"
+    }
+}
+
 @MainActor
 final class MainViewController: NSViewController, NSCollectionViewDataSource, NSCollectionViewDelegate {
     private var assets: [InjectedAsset] = []
     private var groups: [(name: String, items: [InjectedAsset])] = []
-    private var status: StatusInfo?
     private var selectedID: String?
-    private var busy = false
-    private var progressRowVisible = false
     private var transcodingProgress: [String: Double] = [:]  // 资产名 → 转码进度(支持并发)
     private var transcodingItems: [String: AssetCardItem] = [:]  // 资产名 → 卡片(各自更新进度)
     private var pendingAssets: [String: InjectedAsset] = [:]  // 转码中资产(刷新/完成 reload 时保留)
 
     // 视图
     private let collectionView = NSCollectionView()
-    private let logView = NSTextView()
-
 
     private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
-    private let selectButton = NSButton(title: "设为壁纸", target: nil, action: nil)
-    private let injectButton = NSButton(title: "注入新壁纸", target: nil, action: nil)
+    private let injectButton = NSButton(title: "添加壁纸", target: nil, action: nil)
     private let deleteButton = NSButton(title: "删除选中", target: nil, action: nil)
-    private let restoreButton = NSButton(title: "恢复基线", target: nil, action: nil)
 
     override func loadView() {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 860, height: 560))
@@ -43,22 +82,18 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
         let toolbar = NSStackView(views: [])
         toolbar.orientation = .horizontal
         toolbar.spacing = 8
-        configure(selectButton, #selector(doSelect), "desktopcomputer")
         configure(injectButton, #selector(doInject), "plus")
-        configure(restoreButton, #selector(doRestore), "arrow.counterclockwise")
         configure(deleteButton, #selector(doDelete), "trash")
         configure(refreshButton, #selector(doRefresh), "arrow.clockwise")
-        toolbar.addArrangedSubview(selectButton)
         toolbar.addArrangedSubview(injectButton)
         toolbar.addArrangedSubview(deleteButton)
-        toolbar.addArrangedSubview(restoreButton)
         toolbar.addArrangedSubview(NSView())
         toolbar.addArrangedSubview(refreshButton)
         toolbar.translatesAutoresizingMaskIntoConstraints = false
 
         // 左:缩略图网格(壁纸面板式排列:分类分组,左对齐,卡片完整缩略图)
         let listScroll = NSScrollView()
-        let layout = NSCollectionViewFlowLayout()
+        let layout = LeftAlignedFlowLayout()
         layout.itemSize = NSSize(width: 160, height: 144)
         layout.sectionInset = NSEdgeInsets(top: 4, left: 8, bottom: 7, right: 8)
         layout.minimumInteritemSpacing = 10
@@ -76,61 +111,20 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
         listScroll.documentView = collectionView
         listScroll.hasVerticalScroller = true
 
-        let leftStack = NSStackView(views: [listScroll])
-        leftStack.orientation = .vertical
-        leftStack.spacing = 6
-        leftStack.translatesAutoresizingMaskIntoConstraints = false
         listScroll.translatesAutoresizingMaskIntoConstraints = false
 
-        let leftContainer = NSStackView(views: [leftStack])
-        leftContainer.orientation = .vertical
-        leftContainer.spacing = 8
-        leftContainer.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            listScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 300),
-            leftContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 300),
-        ])
-
-        // 右:日志
-        let logTitle = NSTextField(labelWithString: "操作日志")
-        logTitle.font = .boldSystemFont(ofSize: 14)
-        logView.isEditable = false
-        logView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        logView.backgroundColor = .textBackgroundColor
-        let logScroll = NSScrollView()
-        logScroll.documentView = logView
-        logScroll.hasVerticalScroller = true
-        logScroll.borderType = .bezelBorder
-
-        let rightStack = NSStackView(views: [logTitle, logScroll])
-        rightStack.orientation = .vertical
-        rightStack.spacing = 6
-        rightStack.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            logScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 300),
-        ])
-
-        // 整体 split
-        let split = NSSplitView()
-        split.isVertical = true
-        split.dividerStyle = .thin
-        split.addArrangedSubview(leftContainer)
-        split.addArrangedSubview(rightStack)
-        split.translatesAutoresizingMaskIntoConstraints = false
-
         view.addSubview(toolbar)
-        view.addSubview(split)
+        view.addSubview(listScroll)
         NSLayoutConstraint.activate([
             toolbar.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
             toolbar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             toolbar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
 
-            split.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 8),
-            split.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
-            split.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
-            split.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8),
+            listScroll.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 8),
+            listScroll.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
+            listScroll.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+            listScroll.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8),
         ])
-        split.setPosition(430, ofDividerAt: 0)
     }
 
     private func configure(_ button: NSButton, _ action: Selector, _ symbol: String) {
@@ -144,7 +138,7 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
     // MARK: 数据
 
     private func reload() {
-        setBusy(true)
+        setBusy()
         Task {
             let svc = WallpaperService.shared
             let (list, st) = await (svc.list(), svc.status())
@@ -154,7 +148,6 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
                 merged.append(pa)
             }
             self.assets = merged
-            self.status = st
             self.rebuildGroups()
                 self.collectionView.reloadData()
                         self.appendLog("已加载 \(list.count) 个注入资产")
@@ -172,59 +165,34 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
             } else if !choiceID.isEmpty {
                 self.appendLog("choice 指向非注入资产或已失效资产")
             }
-            self.setBusy(false)
+            self.setBusy()
         }
     }
 
-    private func setBusy(_ b: Bool) {
-        busy = b
+    private func setBusy() {
         // 转码在后台并行执行:全部按钮可用(可并发注入多个)
         injectButton.isEnabled = true
         deleteButton.isEnabled = selectedID != nil
-        selectButton.isEnabled = selectedID != nil
-        restoreButton.isEnabled = true
         refreshButton.isEnabled = true
     }
 
+    /// 日志仅落盘(菜单「导出日志」读取),不在界面显示
     private func appendLog(_ s: String) {
-        logView.textStorage?.append(NSAttributedString(string: s + "\n"))
-        logView.scrollToEndOfDocument(nil)
-        // 落盘便于诊断
-        if let h = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first {
-            let logFile = h.appendingPathComponent("Logs/mwi_panel.log")
-            if let d = (s + "\n").data(using: .utf8) {
-                if let fh = try? FileHandle(forWritingTo: logFile) {
-                    fh.seekToEndOfFile()
-                    fh.write(d)
-                    try? fh.close()
-                } else {
-                    try? d.write(to: logFile)
-                }
-            }
+        guard let h = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first,
+              let d = (s + "\n").data(using: .utf8) else { return }
+        let logFile = h.appendingPathComponent("Logs/mwi_panel.log")
+        if let fh = try? FileHandle(forWritingTo: logFile) {
+            fh.seekToEndOfFile()
+            fh.write(d)
+            try? fh.close()
+        } else {
+            try? d.write(to: logFile)
         }
     }
 
     // MARK: 操作
 
     @objc private func doRefresh() { reload() }
-
-    @objc private func doSelect() {
-        guard let id = selectedID else { return }
-        setBusy(true)
-        Task {
-            do {
-                let out = try await WallpaperService.shared.select(id: id)
-                self.appendLog("select \(id.prefix(8)):\n\(out)")
-                try await Task.sleep(nanoseconds: 2_000_000_000)
-                self.status = await WallpaperService.shared.status()
-                            } catch {
-
-                self.appendLog("ERROR(select): \(error.localizedDescription)")
-                self.showError(error.localizedDescription)
-            }
-            self.setBusy(false)
-        }
-    }
 
     @objc private func doInject() {
         let sheet = InjectSheetController { [weak self] video, name, thumb, newCat in
@@ -235,7 +203,7 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
     }
 
     private func runPrepare(video: URL, name: String, thumb: URL?, newCat: String?) {
-        setBusy(true)
+        setBusy()
         transcodingProgress[name] = 0
         // 立即快速抽帧(原视频)→ 列表先显示缩略图 + 转码中状态
         Task {
@@ -293,7 +261,7 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
                 self.appendLog("ERROR(refresh): \(error.localizedDescription)")
                 self.showError(error.localizedDescription)
             }
-            self.setBusy(false)
+            self.setBusy()
         }
     }
 
@@ -306,7 +274,7 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
         alert.addButton(withTitle: "删除")
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        setBusy(true)
+        setBusy()
         Task {
             do {
                 let out = try await WallpaperService.shared.delete(id: id)
@@ -316,43 +284,13 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
                 self.appendLog(r)
                 let svc = WallpaperService.shared
                 self.assets = await svc.list()
-                self.status = await svc.status()
                 self.rebuildGroups()
                 self.collectionView.reloadData()
                             } catch {
                 self.appendLog("ERROR(delete): \(error.localizedDescription)")
                 self.showError(error.localizedDescription)
             }
-            self.setBusy(false)
-        }
-    }
-
-    @objc private func doRestore() {
-        let alert = NSAlert()
-        alert.messageText = "恢复基线?"
-        alert.informativeText = "将清理注入资产(entries/Index/视频/缩略图)并恢复系统默认壁纸。"
-        alert.addButton(withTitle: "恢复")
-        alert.addButton(withTitle: "取消")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        setBusy(true)
-        Task {
-            do {
-                let out = try await WallpaperService.shared.restore()
-                self.appendLog("restore:\n\(out)")
-                let svc = WallpaperService.shared
-                self.assets = await svc.list()
-                self.status = await svc.status()
-                self.rebuildGroups()
-                self.pendingAssets.removeAll()
-                self.transcodingProgress.removeAll()
-                self.transcodingItems.removeAll()
-                self.collectionView.reloadData()
-                            } catch {
-
-                self.appendLog("ERROR(restore): \(error.localizedDescription)")
-                self.showError(error.localizedDescription)
-            }
-            self.setBusy(false)
+            self.setBusy()
         }
     }
 
@@ -362,6 +300,84 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
         alert.informativeText = msg
         alert.addButton(withTitle: "好")
         alert.runModal()
+    }
+    // MARK: 重命名(右键菜单)
+
+    private func promptRenameAsset(id: String, currentName: String) {
+        let newName = promptRename("重命名壁纸", current: currentName)
+        guard let newName else { return }
+        setBusy()
+        Task {
+            do {
+                let out = try await WallpaperService.shared.renameAsset(id: id, newName: newName)
+                self.appendLog(out)
+                self.assets = await WallpaperService.shared.list()
+                self.rebuildGroups()
+                self.collectionView.reloadData()
+            } catch {
+                self.appendLog("ERROR(rename): \(error.localizedDescription)")
+                self.showError(error.localizedDescription)
+            }
+            self.setBusy()
+        }
+    }
+
+    private func promptRenameCategory(currentName: String) {
+        let newName = promptRename("重命名分类", current: currentName)
+        guard let newName else { return }
+        setBusy()
+        Task {
+            do {
+                let out = try await WallpaperService.shared.renameCategory(oldName: currentName, newName: newName)
+                self.appendLog(out)
+                self.assets = await WallpaperService.shared.list()
+                self.rebuildGroups()
+                self.collectionView.reloadData()
+            } catch {
+                self.appendLog("ERROR(rename): \(error.localizedDescription)")
+                self.showError(error.localizedDescription)
+            }
+            self.setBusy()
+        }
+    }
+
+    /// 弹出重命名输入框,返回新名字(取消/未修改 → nil)
+    private func promptRename(_ title: String, current: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = current
+        alert.accessoryView = field
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != current else { return nil }
+        return name
+    }
+
+    // MARK: 导出日志(菜单)
+
+    @objc func exportLogs() {
+        let h = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first!
+        let logFile = h.appendingPathComponent("Logs/mwi_panel.log")
+        guard FileManager.default.fileExists(atPath: logFile.path) else {
+            showError("暂无日志(应用运行后才会产生)")
+            return
+        }
+        let panel = NSSavePanel()
+        let df = DateFormatter()
+        df.dateFormat = "yyyyMMdd-HHmmss"
+        panel.nameFieldStringValue = "MWI日志-\(df.string(from: Date())).log"
+        panel.allowedContentTypes = [.log]
+        guard panel.runModal() == .OK, let dest = panel.url else { return }
+        do {
+            try FileManager.default.copyItem(at: logFile, to: dest)
+            appendLog("日志已导出: \(dest.path)")
+        } catch {
+            showError("导出失败: \(error.localizedDescription)")
+        }
     }
 
     // MARK: 分组 + 选择
@@ -389,6 +405,9 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
         let asset = groups[indexPath.section].items[indexPath.item]
         let prog = transcodingProgress[asset.name]
         item.configure(asset: asset, progress: prog)
+        item.renameHandler = { [weak self] in
+            self?.promptRenameAsset(id: asset.id, currentName: asset.name)
+        }
         if prog != nil {
             transcodingItems[asset.name] = item
         } else {
@@ -402,7 +421,11 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
                         at indexPath: IndexPath) -> NSView {
         let header = collectionView.makeSupplementaryView(
             ofKind: kind, withIdentifier: .init("Header"), for: indexPath) as! AssetHeaderView
-        header.titleLabel.stringValue = groups[indexPath.section].name
+        let groupName = groups[indexPath.section].name
+        header.titleLabel.stringValue = groupName
+        header.renameHandler = { [weak self] in
+            self?.promptRenameCategory(currentName: groupName)
+        }
         return header
     }
 
@@ -412,18 +435,25 @@ final class MainViewController: NSViewController, NSCollectionViewDataSource, NS
             return
         }
         selectedID = groups[ip.section].items[ip.item].id
-        selectButton.isEnabled = selectedID != nil
-        deleteButton.isEnabled = selectedID != nil
+        deleteButton.isEnabled = true
     }
 
     func collectionView(_ collectionView: NSCollectionView, didDeselectItemsAt indexPaths: Set<IndexPath>) {
         selectedID = nil
-        selectButton.isEnabled = false
         deleteButton.isEnabled = false
     }
 }
 
 // MARK: - 资产卡片(壁纸面板式缩略图)
+
+/// 卡片根视图:拦截右键弹出重命名菜单
+final class CardView: NSView {
+    var onRightClick: ((NSEvent) -> Void)?
+
+    override func rightMouseDown(with event: NSEvent) {
+        onRightClick?(event)
+    }
+}
 
 final class AssetCardItem: NSCollectionViewItem {
     let imgView = NSImageView()
@@ -433,6 +463,7 @@ final class AssetCardItem: NSCollectionViewItem {
     private let ringLayer = CAShapeLayer()           // 背景环
     let progressRing = CAShapeLayer()                // 蓝色进度环(外部更新 strokeEnd)
     private let imgContainer = NSView()              // 缩略图容器(选中蓝框只画在此,不超卡片)
+    var renameHandler: (() -> Void)?                 // 重命名回调(configure 时由控制器设置)
 
     override var isSelected: Bool {
         didSet {
@@ -444,7 +475,7 @@ final class AssetCardItem: NSCollectionViewItem {
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 160, height: 144))
+        view = CardView(frame: NSRect(x: 0, y: 0, width: 160, height: 144))
     }
 
     override func viewDidLoad() {
@@ -526,6 +557,23 @@ final class AssetCardItem: NSCollectionViewItem {
             imgContainer.heightAnchor.constraint(equalToConstant: 100),  // 16:10 壁纸比例
             nameLabel.widthAnchor.constraint(equalToConstant: 160),
         ])
+
+        // 右键 → 重命名菜单
+        (view as? CardView)?.onRightClick = { [weak self] event in
+            self?.showRenameMenu(event: event)
+        }
+    }
+
+    private func showRenameMenu(event: NSEvent) {
+        let menu = NSMenu()
+        let item = NSMenuItem(title: "重命名…", action: #selector(menuRename(_:)), keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+        NSMenu.popUpContextMenu(menu, with: event, for: view)
+    }
+
+    @objc private func menuRename(_ sender: Any?) {
+        renameHandler?()
     }
 
     func configure(asset: InjectedAsset, progress: Double?) {
@@ -543,7 +591,7 @@ final class AssetCardItem: NSCollectionViewItem {
         if !asset.thumb.isEmpty {
             Task {
                 let img = NSImage(contentsOfFile: asset.thumb)
-                await MainActor.run { self.imgView.image = img.map(Self.cropSquare) }
+                await MainActor.run { self.imgView.image = img.map { Self.cropSquare($0) } }
             }
         } else {
             imgView.image = NSImage(systemSymbolName: asset.downloaded ? "arrow.down.circle.fill" : "photo",
@@ -551,24 +599,24 @@ final class AssetCardItem: NSCollectionViewItem {
         }
     }
 
-    /// 按壁纸面板比例重绘:裁剪与原图比例一致的区域(目标比例 108:100),缩放无变形
-    static func cropSquare(_ img: NSImage) -> NSImage {
-        let s = img.size
-        guard s.width > 0, s.height > 0,
-              let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return img }
-        // 目标比例:16:10(系统缩略图 214x130 ≈ 1.65:1;取 160x100)
-        let target = NSSize(width: 160, height: 100)
+    /// 按 16:10 壁纸面板比例重绘:从原图居中裁剪与 target 同比例区域(像素空间计算,scale 无关),缩放无变形。
+    /// 卡片用 160×100;添加壁纸面板预览用 198.4×124(同比例,精确填满不缩放)
+    static func cropSquare(_ img: NSImage, target: NSSize = NSSize(width: 160, height: 100)) -> NSImage {
+        guard let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return img }
+        let pw = CGFloat(cg.width)   // 像素尺寸:裁剪/绘制必须用同一坐标系
+        let ph = CGFloat(cg.height)
+        guard pw > 0, ph > 0, target.width > 0, target.height > 0 else { return img }
         let targetRatio = target.width / target.height
         // 从原图裁剪 targetRatio 区域(居中),保证缩放不变形
         var cropRect: CGRect
-        if s.width / s.height > targetRatio {
+        if pw / ph > targetRatio {
             // 原图更宽 → 裁宽
-            let w = s.height * targetRatio
-            cropRect = CGRect(x: (s.width - w) / 2, y: 0, width: w, height: s.height)
+            let w = ph * targetRatio
+            cropRect = CGRect(x: (pw - w) / 2, y: 0, width: w, height: ph)
         } else {
             // 原图更高 → 裁高
-            let h = s.width / targetRatio
-            cropRect = CGRect(x: 0, y: (s.height - h) / 2, width: s.width, height: h)
+            let h = pw / targetRatio
+            cropRect = CGRect(x: 0, y: (ph - h) / 2, width: pw, height: h)
         }
         guard let cropped = cg.cropping(to: cropRect) else { return img }
         let out = NSImage(size: target)
@@ -584,6 +632,7 @@ final class AssetCardItem: NSCollectionViewItem {
 
 final class AssetHeaderView: NSView {
     let titleLabel = NSTextField(labelWithString: "")
+    var renameHandler: (() -> Void)?  // 重命名回调(控制器设置)
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -597,17 +646,183 @@ final class AssetHeaderView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard renameHandler != nil else { return }
+        let menu = NSMenu()
+        let item = NSMenuItem(title: "重命名分类…", action: #selector(menuRename(_:)), keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func menuRename(_ sender: Any?) {
+        renameHandler?()
+    }
 }
 
-// MARK: - 注入面板(AppKit sheet)
+// MARK: - 添加壁纸面板(AppKit sheet)
+
+/// 视频选择区:点击选择或拖入视频;选中后显示预览缩略图 + 文件名。
+/// 空态与选中态均为居中构图,切换只换内容,位置与边框不变(不跳变)
+final class DropZoneView: NSView {
+    var onPick: (() -> Void)?
+    var onDrop: ((URL) -> Void)?
+
+    private let iconView = NSImageView()
+    private let titleLabel = NSTextField(labelWithString: "点击选择或拖入视频文件")
+    private let hintLabel = NSTextField(labelWithString: "MOV · MP4 · MKV · WebM 等,自动转码为动态壁纸")
+    private let thumbView = NSImageView()
+    private let captionLabel = NSTextField(labelWithString: "")
+    private let spinner = NSProgressIndicator()          // 缩略图未就绪时的占位转圈
+    private let emptyStack = NSStackView(views: [])      // 空态:图标 + 提示(居中)
+    private let selectedStack = NSStackView(views: [])   // 选中态:预览 + 文件名(居中)
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        layer?.borderWidth = 1.5
+        layer?.borderColor = NSColor.separatorColor.cgColor
+        layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.5).cgColor
+        registerForDraggedTypes([.fileURL])
+
+        iconView.image = NSImage(systemSymbolName: "film.stack", accessibilityDescription: nil)
+        iconView.contentTintColor = .secondaryLabelColor
+        iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 34, weight: .regular)
+        titleLabel.font = .systemFont(ofSize: 14, weight: .medium)
+        titleLabel.alignment = .center
+        hintLabel.font = .systemFont(ofSize: 11)
+        hintLabel.textColor = .secondaryLabelColor
+        hintLabel.alignment = .center
+
+        thumbView.imageScaling = .scaleProportionallyUpOrDown
+        thumbView.wantsLayer = true
+        thumbView.layer?.cornerRadius = 8
+        thumbView.layer?.masksToBounds = true
+
+        captionLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        captionLabel.alignment = .center
+        captionLabel.lineBreakMode = .byTruncatingMiddle
+        captionLabel.textColor = .labelColor
+
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isHidden = true
+
+        emptyStack.addArrangedSubview(iconView)
+        emptyStack.addArrangedSubview(titleLabel)
+        emptyStack.addArrangedSubview(hintLabel)
+        emptyStack.orientation = .vertical
+        emptyStack.spacing = 6
+        emptyStack.alignment = .centerX
+
+        selectedStack.addArrangedSubview(thumbView)
+        selectedStack.addArrangedSubview(captionLabel)
+        selectedStack.orientation = .vertical
+        selectedStack.spacing = 8
+        selectedStack.alignment = .centerX
+        selectedStack.detachesHiddenViews = false  // 隐藏缩略图时保留占位,文件名位置不变
+        selectedStack.isHidden = true
+
+        let click = NSClickGestureRecognizer(target: self, action: #selector(zoneClicked))
+        addGestureRecognizer(click)
+
+        for v in [emptyStack, selectedStack, spinner] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            emptyStack.centerXAnchor.constraint(equalTo: centerXAnchor),
+            emptyStack.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            selectedStack.centerXAnchor.constraint(equalTo: centerXAnchor),
+            selectedStack.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            thumbView.widthAnchor.constraint(equalToConstant: 200),  // 精确 16:10(200×125),与主界面一致
+            thumbView.heightAnchor.constraint(equalToConstant: 125),
+
+            captionLabel.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, constant: -24),
+
+            spinner.centerXAnchor.constraint(equalTo: centerXAnchor),
+            spinner.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -8),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    // MARK: 状态
+
+    /// 空态:图标 + 提示(未选视频)
+    func showEmpty() {
+        emptyStack.isHidden = false
+        selectedStack.isHidden = true
+        spinner.isHidden = true
+        spinner.stopAnimation(nil)
+    }
+
+    /// 选中态:文件名常显;缩略图未就绪时转圈占位(位置与边框均不变)
+    func showSelected(name: String, image: NSImage?) {
+        emptyStack.isHidden = true
+        selectedStack.isHidden = false
+        thumbView.image = image
+        thumbView.isHidden = image == nil
+        captionLabel.stringValue = name
+        if image == nil {
+            spinner.isHidden = false
+            spinner.startAnimation(nil)
+        } else {
+            spinner.isHidden = true
+            spinner.stopAnimation(nil)
+        }
+    }
+
+    // MARK: 点击 / 拖放
+
+    @objc private func zoneClicked() {
+        onPick?()
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard draggedURL(sender) != nil else { return [] }
+        setHighlighted(true)
+        return .copy
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        setHighlighted(false)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        setHighlighted(false)
+        guard let url = draggedURL(sender) else { return false }
+        onDrop?(url)
+        return true
+    }
+
+    private func draggedURL(_ sender: NSDraggingInfo) -> URL? {
+        let urls = sender.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]
+        return urls?.first
+    }
+
+    private func setHighlighted(_ h: Bool) {
+        layer?.borderColor = (h ? NSColor.controlAccentColor : NSColor.separatorColor).cgColor
+        layer?.backgroundColor = (h
+            ? NSColor.controlAccentColor.withAlphaComponent(0.12)
+            : NSColor.controlBackgroundColor.withAlphaComponent(0.5)).cgColor
+    }
+}
 
 @MainActor
 final class InjectSheetController: NSViewController {
     private let onSubmit: (URL?, String, URL?, String?) -> Void
     private var videoURL: URL?
-    private let videoField = NSTextField(labelWithString: "(未选择)")
+    private var previewURL: URL?          // 已生成的缩略图文件(注入复用,避免重复抽帧)
     private let nameField = NSTextField()
     private let catField = NSTextField()
+    private let addButton = NSButton(title: "添加壁纸", target: nil, action: nil)
+    private let dropZone = DropZoneView(frame: .zero)
 
     init(onSubmit: @escaping (URL?, String, URL?, String?) -> Void) {
         self.onSubmit = onSubmit
@@ -617,56 +832,81 @@ final class InjectSheetController: NSViewController {
     required init?(coder: NSCoder) { fatalError() }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 240))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 448))
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "注入新壁纸"
 
-        let videoRow = row("视频:", videoField, button: "选择…", action: #selector(pickVideo))
-        let nameRow = row("名称:", nameField, button: nil, action: nil)
-        let catRow = row("新分类:", catField, button: nil, action: nil)
+        // 标题 + 副标题
+        let titleLabel = NSTextField(labelWithString: "添加壁纸")
+        titleLabel.font = .boldSystemFont(ofSize: 20)
+        let subtitle = NSTextField(labelWithString: "选择视频并命名,自动转码为 macOS 动态壁纸")
+        subtitle.font = .systemFont(ofSize: 12)
+        subtitle.textColor = .secondaryLabelColor
+
+        // 视频选择区(点击 / 拖入)
+        dropZone.onPick = { [weak self] in self?.pickVideo() }
+        dropZone.onDrop = { [weak self] url in self?.acceptVideo(url) }
+        dropZone.translatesAutoresizingMaskIntoConstraints = false
+
+        // 名称 / 分类
+        let nameRow = fieldRow("名称", nameField)
+        nameField.placeholderString = "壁纸显示名称"
+        let catRow = fieldRow("分类", catField)
         catField.stringValue = "MWI"
-        catField.placeholderString = "新分类名(默认 MWI 独立分类)"
+        catField.placeholderString = "默认 MWI;输入新名称创建独立分类"
+        let catHint = NSTextField(labelWithString: "留空或保持默认归入 MWI 分类;输入新名称会创建独立分类")
+        catHint.font = .systemFont(ofSize: 11)
+        catHint.textColor = .secondaryLabelColor
 
+        // 按钮
         let cancel = NSButton(title: "取消", target: self, action: #selector(cancelTapped))
         cancel.keyEquivalent = "\u{1b}"
-        let ok = NSButton(title: "注入", target: self, action: #selector(okTapped))
-        ok.bezelStyle = .rounded
-        ok.keyEquivalent = "\r"
-        let buttons = NSStackView(views: [NSView(), cancel, ok])
+        cancel.bezelStyle = .rounded
+        addButton.target = self
+        addButton.action = #selector(okTapped)
+        addButton.bezelStyle = .rounded
+        addButton.keyEquivalent = "\r"
+        addButton.isEnabled = false
+        let buttons = NSStackView(views: [NSView(), cancel, addButton])
         buttons.orientation = .horizontal
         buttons.spacing = 8
 
-        let stack = NSStackView(views: [videoRow, nameRow, catRow, buttons])
+        let stack = NSStackView(views: [titleLabel, subtitle, dropZone, nameRow, catRow, catHint, buttons])
         stack.orientation = .vertical
-        stack.spacing = 14
+        stack.spacing = 10
+        stack.setCustomSpacing(18, after: subtitle)
+        stack.setCustomSpacing(16, after: dropZone)
+        stack.setCustomSpacing(16, after: catHint)
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
-            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 20),
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor, constant: -20),
+
+            dropZone.heightAnchor.constraint(equalToConstant: 160),
+            nameRow.heightAnchor.constraint(equalToConstant: 26),
+            catRow.heightAnchor.constraint(equalToConstant: 26),
         ])
     }
 
-    private func row(_ label: String, _ field: NSTextField, button: String?, action: Selector?) -> NSView {
+    private func fieldRow(_ label: String, _ field: NSTextField) -> NSView {
         let l = NSTextField(labelWithString: label)
+        l.font = .systemFont(ofSize: 13)
         l.alignment = .right
         l.widthAnchor.constraint(equalToConstant: 56).isActive = true
-        field.lineBreakMode = .byTruncatingMiddle
-        if field.isEditable { field.isEditable = true }
+        field.font = .systemFont(ofSize: 13)
+        field.bezelStyle = .roundedBezel
         let stack = NSStackView(views: [l, field])
         stack.orientation = .horizontal
-        stack.spacing = 8
-        if let button, let action {
-            let b = NSButton(title: button, target: self, action: action)
-            b.bezelStyle = .rounded
-            stack.addArrangedSubview(b)
-        }
+        stack.spacing = 10
         return stack
     }
+
+    // MARK: 选择视频
 
     @objc private func pickVideo() {
         let p = NSOpenPanel()
@@ -674,10 +914,28 @@ final class InjectSheetController: NSViewController {
         p.allowedContentTypes = [.movie, .video, .quickTimeMovie, .mpeg4Movie, .audiovisualContent, .item]
         p.allowsMultipleSelection = false
         if p.runModal() == .OK, let url = p.url {
-            videoURL = url
-            videoField.stringValue = url.lastPathComponent
-            if nameField.stringValue.isEmpty {
-                nameField.stringValue = url.deletingPathExtension().lastPathComponent
+            acceptVideo(url)
+        }
+    }
+
+    /// 选中/拖入视频:立即更新界面,后台抽帧生成预览与注入缩略图
+    private func acceptVideo(_ url: URL) {
+        videoURL = url
+        previewURL = nil
+        nameField.stringValue = url.deletingPathExtension().lastPathComponent
+        addButton.isEnabled = true
+        dropZone.showSelected(name: url.lastPathComponent, image: nil)
+        Task {
+            let thumb = try? await Task.detached(priority: .utility) {
+                try ThumbnailExtractor.extractFrame(from: url)
+            }.value
+            // 预览按主界面 16:10 裁切填充,输出尺寸 = 显示帧尺寸(精确填满,不再二次缩放)
+            let img = thumb.flatMap { NSImage(contentsOfFile: $0.path) }
+                .map { AssetCardItem.cropSquare($0, target: NSSize(width: 200, height: 125)) }
+            await MainActor.run {
+                guard self.videoURL == url else { return }  // 期间又换了视频 → 丢弃过期预览
+                self.previewURL = thumb
+                self.dropZone.showSelected(name: url.lastPathComponent, image: img)
             }
         }
     }
@@ -690,7 +948,7 @@ final class InjectSheetController: NSViewController {
         let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
         guard videoURL != nil, !name.isEmpty else { return }
         let cat = catField.stringValue.trimmingCharacters(in: .whitespaces)
-        onSubmit(videoURL, name, nil, cat.isEmpty ? nil : cat)
+        onSubmit(videoURL, name, previewURL, cat.isEmpty ? nil : cat)
         dismiss(self)
     }
 }

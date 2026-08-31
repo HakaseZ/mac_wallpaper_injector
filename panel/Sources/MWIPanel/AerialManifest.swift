@@ -130,6 +130,42 @@ enum AerialManifest {
         return log
     }
 
+    // MARK: 重命名(资产/分类,右键菜单)
+
+    /// 重命名资产(localizedNameKey + accessibilityLabel 同步)
+    @discardableResult
+    static func renameAsset(id: String, newName: String) throws -> String {
+        var d = loadEntries()
+        var assets = d["assets"] as? [[String: Any]] ?? []
+        guard let idx = assets.firstIndex(where: { ($0["id"] as? String) == id }) else {
+            throw ServiceError.msg("asset \(id.prefix(8)) not found in entries.json")
+        }
+        assets[idx]["localizedNameKey"] = newName
+        assets[idx]["accessibilityLabel"] = newName
+        d["assets"] = assets
+        try JSONFile.saveDict(d, to: Paths.entries)
+        return "renamed asset \(id.prefix(8)) → \(newName)\n"
+    }
+
+    /// 重命名分类(仅自定义分类;系统 fallback 分类只读,防止改坏原厂清单)
+    @discardableResult
+    static func renameCategory(oldName: String, newName: String) throws -> String {
+        var d = loadEntries()
+        var cats = d["categories"] as? [[String: Any]] ?? []
+        guard let idx = cats.firstIndex(where: { ($0["localizedNameKey"] as? String) == oldName }) else {
+            throw ServiceError.msg("category '\(oldName)' not found in entries.json")
+        }
+        let cid = (cats[idx]["id"] as? String) ?? ""
+        let systemIDs = Set((loadFallback()["categories"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String })
+        guard !systemIDs.contains(cid) else {
+            throw ServiceError.msg("系统分类不可重命名")
+        }
+        cats[idx]["localizedNameKey"] = newName
+        d["categories"] = cats
+        try JSONFile.saveDict(d, to: Paths.entries)
+        return "renamed category \(oldName) → \(newName)\n"
+    }
+
     /// 列出注入资产(url 指向本地 127.0.0.1)+ 当前 choice
     static func list() -> ([InjectedAsset], [String: String]) {
         let d = loadEntries()

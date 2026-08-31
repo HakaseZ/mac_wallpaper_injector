@@ -138,6 +138,16 @@ actor WallpaperService {
 
     @discardableResult
     func refresh() throws -> String {
+        var log = clearViewModelCache()
+        killAgent()
+        sleep(5)
+        openWallpaperPanel()
+        log += "agent restarted, wallpaper panel opened\n"
+        return log
+    }
+
+    /// 删除系统壁纸扩展的 view-model 缓存(下次从 entries.json 重建 → 改名/增删即时生效)
+    private func clearViewModelCache() -> String {
         var log = ""
         let fm = FileManager.default
         for name in ["extension-com.apple.wallpaper.extension.aerials-desktop",
@@ -148,10 +158,6 @@ actor WallpaperService {
                 log += "cache cleared: \(name)\n"
             }
         }
-        killAgent()
-        sleep(5)
-        openWallpaperPanel()
-        log += "agent restarted, wallpaper panel opened\n"
         return log
     }
 
@@ -253,6 +259,28 @@ actor WallpaperService {
         }
         killAgent()
         return log + "deleted \(name)\(id.prefix(8))\n"
+    }
+
+    // MARK: rename(右键菜单重命名资产/分类;改名同步到系统壁纸设置)
+
+    @discardableResult
+    func renameAsset(id: String, newName: String) throws -> String {
+        let log = try AerialManifest.renameAsset(id: id, newName: newName)
+        return log + syncToWallpaperSettings()
+    }
+
+    @discardableResult
+    func renameCategory(oldName: String, newName: String) throws -> String {
+        let log = try AerialManifest.renameCategory(oldName: oldName, newName: newName)
+        return log + syncToWallpaperSettings()
+    }
+
+    /// 清缓存 + 重启 agent → 系统壁纸设置(壁纸面板)下次打开即显示新名称
+    private func syncToWallpaperSettings() -> String {
+        var log = clearViewModelCache()
+        killAgent()
+        log += "agent restarted(改名已同步到系统壁纸设置)\n"
+        return log
     }
 
     // MARK: prepare(异步,带进度)

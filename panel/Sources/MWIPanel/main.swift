@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let vc = MainViewController()
+        setupMainMenu(exportTarget: vc)
         window = NSWindow(contentViewController: vc)
         window.title = "MWI 壁纸管理"
         window.setContentSize(NSSize(width: 860, height: 560))
@@ -30,4 +31,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// 主菜单:App 菜单 + 日志菜单(导出日志;日志不再放界面)
+    private func setupMainMenu(exportTarget: MainViewController) {
+        let mainMenu = NSMenu()
+        let appItem = NSMenuItem()
+        mainMenu.addItem(appItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "关于 MWI 壁纸管理",
+                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "退出 MWI 壁纸管理",
+                        action: #selector(NSApplication.terminate(_:)),
+                        keyEquivalent: "q")
+        appItem.submenu = appMenu
+
+        let logItem = NSMenuItem()
+        mainMenu.addItem(logItem)
+        let logMenu = NSMenu(title: "日志")
+        let export = NSMenuItem(title: "导出日志…",
+                                action: #selector(MainViewController.exportLogs),
+                                keyEquivalent: "")
+        export.target = exportTarget
+        logMenu.addItem(export)
+        logItem.submenu = logMenu
+
+        NSApp.mainMenu = mainMenu
+    }
 }
