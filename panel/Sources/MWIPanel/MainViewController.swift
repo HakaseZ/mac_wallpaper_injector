@@ -670,7 +670,8 @@ final class InjectSheetController: NSViewController {
 
     @objc private func pickVideo() {
         let p = NSOpenPanel()
-        p.allowedContentTypes = [.movie, .video, .quickTimeMovie, .mpeg4Movie]
+        // 全种类视频可选:MKV/WebM/AVI 等未注册 UTType 也能选(.item 兜底);ffmpeg 负责转码
+        p.allowedContentTypes = [.movie, .video, .quickTimeMovie, .mpeg4Movie, .audiovisualContent, .item]
         p.allowsMultipleSelection = false
         if p.runModal() == .OK, let url = p.url {
             videoURL = url

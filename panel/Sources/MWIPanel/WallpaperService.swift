@@ -83,6 +83,8 @@ final class HTTPServer {
 
 actor WallpaperService {
     static let shared = WallpaperService()
+    /// 全局转码门:并发注入时转码排队(总 CPU 限速 ≈ 单转码限速,不随并发数线性叠加)
+    private static let transcodeGate = DispatchSemaphore(value: 1)
     private var httpServer: HTTPServer?
 
     // MARK: list / status
@@ -255,6 +257,12 @@ actor WallpaperService {
 
     // MARK: prepare(异步,带进度)
 
+    struct PreparedFiles {
+        let assetID: String
+        let video: URL
+        let thumb: URL
+    }
+
     enum PrepareEvent {
         case stage(String)     // 阶段文本(转码/补丁/注入)
         case progress(Double)  // 0-1
@@ -263,18 +271,21 @@ actor WallpaperService {
         case error(String)
     }
 
-    /// 后台完整注入流程(转码在 detached 非隔离执行,不阻塞 actor/UI)
+    /// 后台完整注入流程。
+    /// 转码/补丁/预置在 detached 并行执行(各自限速,互不阻塞);entries 写入走 actor 串行(避免并发覆盖丢资产)
     func prepareStream(videoURL: URL, name: String, thumbnailURL: URL?, newCategory: String?) -> AsyncStream<PrepareEvent> {
         AsyncStream { continuation in
             Task {
                 do {
-                    let core = try await Task.detached(priority: .utility) {
-                        try WallpaperService.prepareCore(
-                            videoURL: videoURL, name: name, thumbnailURL: thumbnailURL, newCategory: newCategory,
+                    let files = try await Task.detached(priority: .utility) {
+                        try WallpaperService.prepareFiles(
+                            videoURL: videoURL, thumbnailURL: thumbnailURL,
                             stage: { continuation.yield(.stage($0)) },
                             progress: { continuation.yield(.progress($0)) })
                     }.value
-                    continuation.yield(.done(core))
+                    // 注入(actor 串行:并发 prepareStream 依次写 entries,不互相覆盖)
+                    let log = try await self.injectPrepared(files: files, name: name, newCategory: newCategory)
+                    continuation.yield(.done(log))
                 } catch {
                     continuation.yield(.error(error.localizedDescription))
                 }
@@ -283,34 +294,42 @@ actor WallpaperService {
         }
     }
 
+    /// entries 注入(actor 隔离 → 串行执行)
+    private func injectPrepared(files: PreparedFiles, name: String, newCategory: String?) throws -> String {
+        try AerialManifest.inject(assetID: files.assetID, name: name, newCategory: newCategory)
+    }
+
     /// 同步版本(测试/内部用)
     @discardableResult
     func prepare(videoURL: URL, name: String, thumbnailURL: URL?, newCategory: String?) throws -> String {
-        let core = try WallpaperService.prepareCore(
-            videoURL: videoURL, name: name, thumbnailURL: thumbnailURL, newCategory: newCategory,
-            stage: { _ in }, progress: { _ in })
-        return core
+        let files = try WallpaperService.prepareFiles(
+            videoURL: videoURL, thumbnailURL: thumbnailURL, stage: { _ in }, progress: { _ in })
+        return try injectPrepared(files: files, name: name, newCategory: newCategory)
     }
 
-    /// 非隔离核心:转码(限速+进度)→ 补丁 → 复制 → 缩略图 → entries 注入
-    private static func prepareCore(videoURL: URL, name: String, thumbnailURL: URL?, newCategory: String?,
-                                    stage: @escaping @Sendable (String) -> Void,
-                                    progress: @escaping @Sendable (Double) -> Void) throws -> String {
-        let port = Paths.defaultPort
+    /// 非隔离核心:转码(限速+进度)→ 补丁 → 预置 videos/thumbnails(不写 entries,并发安全)
+    private static func prepareFiles(videoURL: URL, thumbnailURL: URL?,
+                                     stage: @escaping @Sendable (String) -> Void,
+                                     progress: @escaping @Sendable (Double) -> Void) throws -> PreparedFiles {
         let assetID = UUID().uuidString.uppercased()
         let fm = FileManager.default
-        var log = ""
 
-        // 0. 编码检测:非 HEVC(hvc1/hev1)→ ffmpeg 转码(aerials 解码器仅支持 HEVC)
+        // 0. 编码检测:仅当 hvc1(经典 QuickTime,样本表齐备)且容器级合规才跳过转码;
+        //    合规 = 10bit yuv420p10le + timescale 240000 + 整数帧率(规格硬条件)。
+        //    其余全部转码 — hev1(tag 不合规)、avc1/VP9/AV1、非 QuickTime 容器、fMP4,
+        //    以及 hvc1 但不合规(8bit/全范围/错误 timescale,如 yuvj420p@15360 → 引擎拒播)
         var video = videoURL
-        if let codec = MOVPatcher.codecOf(video), codec != "hvc1", codec != "hev1" {
-            stage("转码 HEVC 中(后台限速,避免发热)...")
-            log += "codec \(codec) 非 HEVC,ffmpeg 转码中(HEVC 10bit)...\n"
-            let tmp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString + "_mwi.mov")
-            try runFFmpegTranscode(input: video, output: tmp, progress: progress)
-            video = tmp
+        let probe = (try? probeVideo(input: video)) ?? VideoProbe(
+            hasVideo: true, fps: nil, isHDR: false, needsEvenScale: false, duration: 0, isCompliantHEVC: false)
+        if let codec = MOVPatcher.codecOf(video), codec == "hvc1", probe.hasVideo, probe.isCompliantHEVC {
+            stage("视频已是合规 HEVC(10bit/240000/整数帧率),跳过转码")
         } else {
-            stage("视频已是 HEVC,跳过转码")
+            stage("转码 HEVC 中(后台限速,避免发热)...")
+            let tmp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString + "_mwi.mov")
+            transcodeGate.wait()  // 排队:同时最多一个转码 → 总 CPU 限速
+            defer { transcodeGate.signal() }
+            try runFFmpegTranscode(input: video, probe: probe, output: tmp, progress: progress)
+            video = tmp
         }
 
         // 1. 打补丁(未打则输出 _patched.mov)
@@ -337,39 +356,48 @@ actor WallpaperService {
             if fm.fileExists(atPath: cand.path) {
                 thumbURL = cand
             } else {
-                thumbURL = try ThumbnailExtractor.extractFrame(from: video)
+                do {
+                    thumbURL = try ThumbnailExtractor.extractFrame(from: video)
+                } catch {
+                    // AVFoundation 打不开(异常/边缘 hvc1)→ ffmpeg 抽帧兜底
+                    thumbURL = try Self.ffmpegFrameGrab(video)
+                }
             }
         }
         let destThumb = Paths.thumbnailsDir.appendingPathComponent("\(assetID).png")
         try? fm.removeItem(at: destThumb)
         try fm.copyItem(at: thumbURL, to: destThumb)
-
-        // 4. entries 注入
-        stage("写入 entries.json")
-        log += try AerialManifest.inject(assetID: assetID, name: name, newCategory: newCategory)
-        return log
+        return PreparedFiles(assetID: assetID, video: video, thumb: destThumb)
     }
 
     /// 调 ffmpeg 转码为 aerials 合规 HEVC 10bit(非隔离,detached 可调用)。
-    /// 性能限制:线程数 = max(2, 核数/2) + nice 10(不抢系统资源、避免急剧发热)
-    /// 进度:ffmpeg -progress pipe:1 输出 out_time_us,经 progress 回调(0-1)
-    private static func runFFmpegTranscode(input: URL, output: URL,
+    /// 全种类输入兼容:帧率整数归一、HDR(PQ/HLG)→BT.709 SDR tonemap、奇数分辨率偶数化、
+    /// BT.709 色标签走 setparams(filter 链;ffmpeg 9 输出级 -color_* 选项不可靠,文档实测)。
+    /// 性能限制:单线程 + nice 20 → CPU ~10%,风扇安静
+    /// 进度:ffmpeg -progress pipe:1 输出 out_time_us,经 progress 回调(0-1,分母取 ffprobe 时长)
+    private static func runFFmpegTranscode(input: URL, probe: VideoProbe, output: URL,
                                            progress: @escaping @Sendable (Double) -> Void) throws {
-        let candidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-        guard let ffmpeg = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+        guard let ffmpeg = Self.ffmpegPath() else {
             throw ServiceError.msg("ffmpeg 未安装(需转码 HEVC);brew install ffmpeg")
         }
-        // 视频总时长(进度分母)
-        let duration = AVURLAsset(url: input).duration.seconds
-        // 线程限制:单线程 + nice 20 → CPU ~10%,风扇安静
+        guard probe.hasVideo else {
+            throw ServiceError.msg("未检测到视频轨: \(input.lastPathComponent)")
+        }
+        // filter 链:帧率整数归一(29.97→30)→ HDR tonemap → 奇数分辨率偶数化 → 10bit → BT.709 标签
+        var vf: [String] = []
+        if let fps = probe.fps { vf.append("fps=fps=\(fps)") }
+        if probe.isHDR { vf.append("tonemap=hable") }
+        if probe.needsEvenScale { vf.append("scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos") }
+        vf.append("format=yuv420p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709")
         let threads = 1
         let args = ["-y", "-i", input.path,
+                    "-vf", vf.joined(separator: ","),
                     "-c:v", "libx265", "-preset", "medium", "-crf", "18",
                     "-x265-params",
                     "keyint=60:min-keyint=60:scenecut=0:bframes=4:b-adapt=2:b-pyramid=1:temporal-layers=3",
-                    "-pix_fmt", "yuv420p10le", "-profile:v", "main10", "-tag:v", "hvc1",
-                    "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-                    "-color_range", "tv", "-video_track_timescale", "240000", "-an",
+                    "-tag:v", "hvc1",
+                    "-video_track_timescale", "240000", "-an",
+                    "-movflags", "+faststart",
                     "-threads", "\(threads)",
                     "-progress", "pipe:1",
                     output.path]
@@ -386,7 +414,7 @@ actor WallpaperService {
         // 异步读进度输出(out_time_us)
         let fh = outPipe.fileHandleForReading
         var acc = Data()
-        let d = duration > 0 ? duration : 1
+        let d = probe.duration > 0 ? probe.duration : 1
         fh.readabilityHandler = { handle in
             let chunk = handle.availableData
             if chunk.isEmpty {
@@ -412,6 +440,100 @@ actor WallpaperService {
             let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             throw ServiceError.msg("ffmpeg 转码失败(exit \(proc.terminationStatus)): \(err.split(separator: "\n").suffix(3).joined(separator: "\n"))")
         }
+    }
+    private static func ffmpegPath() -> String? {
+        let candidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
+    }
+
+    /// ffmpeg 抽帧兜底(AVFoundation 打不开的输入)
+    private static func ffmpegFrameGrab(_ video: URL) throws -> URL {
+        guard let ffmpeg = Self.ffmpegPath() else {
+            throw ServiceError.msg("缩略图生成失败(AVFoundation 不可读,且 ffmpeg 未安装)")
+        }
+        let out = Paths.httpDir.appendingPathComponent(video.deletingPathExtension().lastPathComponent + ".png")
+        try FileManager.default.createDirectory(at: Paths.httpDir, withIntermediateDirectories: true)
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: ffmpeg)
+        proc.arguments = ["-y", "-i", video.path, "-frames:v", "1", "-vf", "scale=640:-2", out.path]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        try proc.run()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else {
+            throw ServiceError.msg("缩略图生成失败(ffmpeg exit \(proc.terminationStatus))")
+        }
+        return out
+    }
+
+    // MARK: ffprobe 探测(任意容器)
+
+    private struct VideoProbe {
+        let hasVideo: Bool
+        let fps: Int?          // 需归一化的整数帧率(29.97→30);CFR 已为整数则 nil
+        let isHDR: Bool        // PQ(smpte2084)/HLG(arib-std-b67)
+        let needsEvenScale: Bool  // yuv420p10le 要求宽高均为偶数
+        let duration: Double
+        let isCompliantHEVC: Bool  // hvc1 + yuv420p10le + 1/240000 + 整数帧率 → 可直接打补丁
+    }
+
+    /// ffprobe 探测视频轨:帧率(CFR/VFR)、色彩传输、分辨率奇偶、时长、容器级合规。任意容器均可读。
+    /// ffmpeg/ffprobe 缺失时降级为不探测(保持旧行为),仅 ffmpeg 安装异常时抛错。
+    private static func probeVideo(input: URL) throws -> VideoProbe {
+        guard let ffmpeg = Self.ffmpegPath() else {
+            return VideoProbe(hasVideo: true, fps: nil, isHDR: false, needsEvenScale: false, duration: 0, isCompliantHEVC: false)
+        }
+        let ffprobe = URL(fileURLWithPath: ffmpeg).deletingLastPathComponent()
+            .appendingPathComponent("ffprobe").path
+        guard FileManager.default.isExecutableFile(atPath: ffprobe) else {
+            return VideoProbe(hasVideo: true, fps: nil, isHDR: false, needsEvenScale: false, duration: 0, isCompliantHEVC: false)
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: ffprobe)
+        proc.arguments = ["-v", "error", "-select_streams", "v:0",
+                          "-show_entries", "stream=r_frame_rate,avg_frame_rate,color_transfer,width,height,pix_fmt,time_base,codec_tag_string:format=duration",
+                          "-of", "json", input.path]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        try proc.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0,
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let streams = obj["streams"] as? [[String: Any]], let s = streams.first else {
+            return VideoProbe(hasVideo: false, fps: nil, isHDR: false, needsEvenScale: false, duration: 0, isCompliantHEVC: false)
+        }
+        func frac(_ v: Any?) -> Double? {
+            guard let str = v as? String else { return nil }
+            let parts = str.split(separator: "/")
+            guard parts.count == 2, let n = Double(parts[0]), let d = Double(parts[1]), d > 0 else { return nil }
+            return n / d
+        }
+        let r = frac(s["r_frame_rate"])
+        let a = frac(s["avg_frame_rate"])
+        var fps: Int?
+        var cfrInteger = false
+        if let r, let a, abs(r - a) < 0.001 {
+            // CFR:非整数才归一(29.97→30,23.976→24);25/30/60 等整数不动
+            if abs(r - r.rounded()) > 0.001 { fps = Int(r.rounded()) } else { cfrInteger = true }
+        } else if let a {
+            // VFR → 按平均帧率 CFR 化(补丁器依赖 stts 单 baseDuration)
+            fps = max(1, Int(a.rounded()))
+        }
+        let transfer = (s["color_transfer"] as? String) ?? ""
+        let isHDR = transfer == "smpte2084" || transfer == "arib-std-b67"
+        let w = (s["width"] as? Int) ?? 0
+        let h = (s["height"] as? Int) ?? 0
+        let needsEvenScale = (w > 0 && w % 2 == 1) || (h > 0 && h % 2 == 1)
+        let durStr = (obj["format"] as? [String: Any])?["duration"] as? String
+        let duration = durStr.flatMap(Double.init) ?? 0
+        let tag = (s["codec_tag_string"] as? String) ?? ""
+        let pixFmt = (s["pix_fmt"] as? String) ?? ""
+        let timeBase = (s["time_base"] as? String) ?? ""
+        let isCompliantHEVC = tag == "hvc1" && pixFmt == "yuv420p10le" && timeBase == "1/240000" && cfrInteger
+        return VideoProbe(hasVideo: true, fps: fps, isHDR: isHDR, needsEvenScale: needsEvenScale, duration: duration, isCompliantHEVC: isCompliantHEVC)
     }
 
     private func startHTTPServer(port: UInt16) throws {

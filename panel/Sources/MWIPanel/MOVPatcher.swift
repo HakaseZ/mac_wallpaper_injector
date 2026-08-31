@@ -176,7 +176,12 @@ enum MOVPatcher {
               let mdia = trak.find("mdia"),
               let minf = mdia.find("minf"),
               let stbl = minf.find("stbl"),
-              let stsd = stbl.find("stsd"), stsd.size >= 20 else { return nil }
+              let stsd = stbl.find("stsd"), stsd.size >= 20,
+              // 经典 QuickTime 样本表齐备、且非碎片化(fMP4 带 mvex,样本在 moof)才算可直接打补丁;
+              // fMP4 返回 nil → prepare 走转码
+              moov.find("mvex") == nil,
+              stbl.find("stsz") != nil, stbl.find("stsc") != nil,
+              (stbl.find("stco") ?? stbl.find("co64")) != nil else { return nil }
         return String(data: data.subdata(in: (stsd.offset + 20)..<(stsd.offset + 24)), encoding: .ascii)
     }
 

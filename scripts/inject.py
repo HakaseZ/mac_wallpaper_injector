@@ -29,6 +29,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 FALLBACK = Path(
@@ -44,16 +45,9 @@ CACHE_DIR = Path(
 BACKUP_DIR = ROOT / "backup/inject"
 STATE = Path("/tmp/mwi_inject_state.json")
 HTTP_DIR = Path("/tmp/mwi_http")
-TEMPLATE_ASSET_ID = "6511D2B5-E185-4886-9505-B4004E920D27"  # Landscape/Golden Gate,字段齐全
 
-TRANSCODE_SPEC = [
-    "-c:v", "libx265", "-preset", "medium", "-crf", "18",
-    "-x265-params",
-    "keyint=60:min-keyint=60:scenecut=0:bframes=4:b-adapt=2:b-pyramid=1:temporal-layers=3",
-    "-pix_fmt", "yuv420p10le", "-profile:v", "main10", "-tag:v", "hvc1",
-    "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-    "-color_range", "tv", "-video_track_timescale", "240000", "-an",
-]
+
+TEMPLATE_ASSET_ID = "6511D2B5-E185-4886-9505-B4004E920D27"  # Landscape/Golden Gate,字段齐全
 
 
 def log(msg: str) -> None:
@@ -96,6 +90,64 @@ def run(cmd: list, check=True) -> subprocess.CompletedProcess:
         sys.exit(f"command failed: {' '.join(cmd[:4])}...")
     return r
 
+def _frac(v) -> Optional[float]:
+    """'30000/1001' → 29.97;解析失败返回 None"""
+    if not isinstance(v, str):
+        return None
+    parts = v.split("/")
+    if len(parts) != 2:
+        return None
+    try:
+        n, d = float(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+    return n / d if d > 0 else None
+
+
+def probe_video(p: Path) -> dict:
+    """ffprobe 探测视频轨:帧率/色彩传输/分辨率奇偶/时长。任意容器。"""
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
+             "stream=r_frame_rate,avg_frame_rate,color_transfer,width,height:format=duration",
+             "-of", "json", str(p)], check=False)
+    if r.returncode != 0 or not r.stdout.strip():
+        return {}
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+
+def transcode_args(video: Path) -> list:
+    """全种类输入兼容的合规 HEVC 转码参数(与 panel 的 WallpaperService 一致):
+    帧率整数归一(29.97→30) / HDR(PQ/HLG) tonemap 到 BT.709 SDR /
+    奇数分辨率偶数化(yuv420p10le 要求) / BT.709 色标签走 setparams(ffmpeg 9 输出级 -color_* 不可靠)。"""
+    probe = probe_video(video)
+    stream = (probe.get("streams") or [{}])[0]
+    r, a = _frac(stream.get("r_frame_rate")), _frac(stream.get("avg_frame_rate"))
+    vf = []
+    if r is not None and a is not None and abs(r - a) < 0.001:
+        # CFR:非整数才归一(29.97→30);25/30/60 等整数不动
+        if abs(r - round(r)) > 0.001:
+            vf.append(f"fps=fps={round(r):g}")
+    elif a is not None:
+        # VFR → 按平均帧率 CFR 化(补丁器依赖 stts 单 baseDuration)
+        vf.append(f"fps=fps={max(1, round(a)):g}")
+    transfer = stream.get("color_transfer") or ""
+    if transfer in ("smpte2084", "arib-std-b67"):
+        vf.append("tonemap=hable")
+    w, h = stream.get("width") or 0, stream.get("height") or 0
+    if (w and w % 2 == 1) or (h and h % 2 == 1):
+        vf.append("scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos")
+    vf.append("format=yuv420p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709")
+    return ["-vf", ",".join(vf),
+            "-c:v", "libx265", "-preset", "medium", "-crf", "18",
+            "-x265-params",
+            "keyint=60:min-keyint=60:scenecut=0:bframes=4:b-adapt=2:b-pyramid=1:temporal-layers=3",
+            "-tag:v", "hvc1",
+            "-video_track_timescale", "240000", "-an",
+            "-movflags", "+faststart"]
+
 
 def cmd_prepare(args) -> None:
     video = Path(args.video).resolve()
@@ -128,7 +180,7 @@ def cmd_prepare(args) -> None:
     if args.transcode:
         out = video.with_name(f"{video.stem}_mwi.mov")
         log(f"transcoding -> {out}")
-        run(["ffmpeg", "-y", "-i", str(video), *TRANSCODE_SPEC, str(out)])
+        run(["ffmpeg", "-y", "-i", str(video), *transcode_args(video), str(out)])
         video = out
         if not args.thumbnail:
             thumb = video.with_suffix(".png")
