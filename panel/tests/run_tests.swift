@@ -1,3 +1,4 @@
+// code-review-marker
 import Foundation
 
 // MWI 沙箱测试:单元 + 集成,全部路径经 Paths.current 注入临时目录,不触碰真实系统壁纸状态。

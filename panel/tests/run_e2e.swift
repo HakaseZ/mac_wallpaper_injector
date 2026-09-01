@@ -1,3 +1,4 @@
+// code-review-marker
 import Foundation
 
 // MWI 系统级 e2e 测试:全链路断言(基线/注入/播放/持久性/删除/恢复),退出码 0=全过。

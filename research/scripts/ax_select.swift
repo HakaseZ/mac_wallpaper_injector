@@ -1,3 +1,4 @@
+// code-review-marker
 // ax_select.swift — 在系统设置壁纸面板中定位并合成点击资产按钮。
 // 用法: swift ax_select.swift "<名称关键字>"
 // 逻辑: 全树递归找 description 含关键字的 AXButton;找不到则对内容区各

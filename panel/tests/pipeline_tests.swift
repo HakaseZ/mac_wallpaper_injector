@@ -1,3 +1,4 @@
+// code-review-marker
 import AVFoundation
 
 // MARK: - 转码→补丁→预置全链路测试(沙箱;ffmpeg 缺失时跳过)

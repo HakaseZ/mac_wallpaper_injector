@@ -1,3 +1,4 @@
+// code-review-marker
 import Foundation
 
 // MARK: - 轻量测试框架(无 XCTest 依赖,swiftc 直编,CLT 环境兼容)
